@@ -205,6 +205,8 @@ export class ConfigPanel implements Component {
   private editing = false;
   private editBuffer = "";
   private readonly edits = new Map<string, unknown>();
+  /** A refused save: shown in place of the key hints, with the pending edits left in place. */
+  private saveError: string | undefined;
   private readonly entries: ConfigEntry[];
 
   constructor(private readonly config: WardenConfig, private readonly theme: ThemeLike, private readonly actions: PanelActions, private readonly requestRender: () => void, private readonly dirs: HostDirs = defaultHostDirs()) {
@@ -221,7 +223,7 @@ export class ConfigPanel implements Component {
       ? `↑↓ navigate · enter toggle/edit · esc ${editing ? "cancel" : "back"} · s save · ${modeLabel}`
       : `click for keys · /warden config closes`;
     out.push(theme.bold(theme.fg("accent", "pi-warden config")) + theme.fg("muted", ` · ${entries.length} keys`));
-    out.push(theme.fg("muted", keys));
+    out.push(this.saveError ? theme.fg("warning", this.saveError) : theme.fg("muted", keys));
     out.push(theme.fg("borderMuted", "─".repeat(Math.max(0, width))));
     for (let index = 0; index < entries.length; index++) {
       const entry = entries[index]!;
@@ -355,7 +357,16 @@ export class ConfigPanel implements Component {
       }
       current[keys.at(-1)!] = value;
     }
-    writeUserConfig(obj, this.dirs);
+    try {
+      writeUserConfig(obj, this.dirs);
+    }
+    catch (error) {
+      // A refused write leaves the file as it is: keep the edits pending and show the reason.
+      this.saveError = error instanceof Error ? error.message : String(error);
+      this.requestRender();
+      return;
+    }
+    this.saveError = undefined;
     this.edits.clear();
   }
 }

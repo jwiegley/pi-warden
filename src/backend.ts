@@ -1,8 +1,11 @@
 import type { BackendSpec, TypeSafeOptions } from "pi-typesafe";
-import { DEFAULT_BACKEND, backendHost, resolveBackend } from "pi-typesafe";
+import { DEFAULT_BACKEND, DECISIONS_BACKENDS, backendHost, resolveBackend } from "pi-typesafe";
 
 /** The judgment backend: a registry name ("typesafe", "openrouter", "commandcode") or a caller-supplied endpoint object. */
 export type JudgmentBackend = BackendSpec;
+
+/** The registry names a judgment backend setting may use; an endpoint object is never named by the environment. */
+export const BACKEND_NAMES: readonly string[] = Object.keys(DECISIONS_BACKENDS);
 
 /** The judgment destination as the config carries it, plus the refusal that turns judgments off when the configured value was refused. */
 export interface BackendSetting {

@@ -1,8 +1,8 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { lstatSync, readFileSync } from "node:fs";
+import { dirname, isAbsolute, join, normalize } from "node:path";
 import { writeFileAtomicSync } from "./atomic.js";
 import type { JudgmentBackend } from "./backend.js";
-import { resolveJudgmentBackend } from "./backend.js";
+import { BACKEND_NAMES, resolveJudgmentBackend } from "./backend.js";
 import { defaultHostDirs } from "./host-dirs.js";
 import type { HostDirs } from "./host-dirs.js";
 import { COMMAND_TOOLS } from "./tools.js";
@@ -973,7 +973,22 @@ function globList(value: unknown, fallback: string[]): string[] {
   return Array.isArray(value) ? value.filter((glob): glob is string => typeof glob === "string" && glob.trim().length > 0).map(glob => glob.trim()) : fallback;
 }
 
-function applyRules(base: RulesConfig, raw: unknown): RulesConfig {
+/**
+ * A project file may name rules files inside the project only. An absolute entry, or one that climbs out of the
+ * project, is dropped with one warning each, so the file cannot name a file elsewhere on the machine; a symlink
+ * inside the project still can.
+ */
+function projectRulesFiles(value: unknown, base: string[], warnings: string[]): string[] {
+  const files = globList(value, base);
+  if (files === base) return base;
+  return files.filter(entry => {
+    const inside = !isAbsolute(entry) && !normalize(entry).split(/[\\/]/).includes("..");
+    if (!inside) warnings.push(`project file: rules.files entry ${JSON.stringify(entry)} is ignored; a project file may name only files inside the project`);
+    return inside;
+  });
+}
+
+function applyRules(base: RulesConfig, raw: unknown, source: "user" | "project" = "user", warnings: string[] = []): RulesConfig {
   if (!isObject(raw)) return base;
   const notes = isObject(raw.sensitivePaths)
     ? Object.fromEntries(Object.entries(raw.sensitivePaths).filter((entry): entry is [string, string] => entry[0].trim().length > 0 && typeof entry[1] === "string" && entry[1].trim().length > 0))
@@ -982,7 +997,7 @@ function applyRules(base: RulesConfig, raw: unknown): RulesConfig {
     enabled: boolean(raw.enabled, base.enabled),
     threshold: probability(raw.threshold, base.threshold),
     softThreshold: probability(raw.softThreshold, base.softThreshold),
-    files: globList(raw.files, base.files),
+    files: source === "project" ? projectRulesFiles(raw.files, base.files, warnings) : globList(raw.files, base.files),
     fallback: boolean(raw.fallback, base.fallback),
     maxChars: Math.max(500, positiveInteger(raw.maxChars, base.maxChars)),
     exclude: globList(raw.exclude, base.exclude),
@@ -1026,7 +1041,7 @@ function applyGuards(base: WardenConfig, raw: Json, timeoutMs: number, source: "
   return {
     compaction: applyCompaction(base.compaction, raw.compaction, source),
     waste: applyWaste(base.waste, raw.waste),
-    rules: applyRules(base.rules, raw.rules),
+    rules: applyRules(base.rules, raw.rules, source, warnings),
     rulesAtTurnStart: applyRulesAtTurnStart(base.rulesAtTurnStart, raw.rulesAtTurnStart, source, warnings),
     runaway: applyRunaway(base.runaway, raw.runaway),
     subagent: applySubagent(base.subagent, raw.subagent),
@@ -1218,17 +1233,152 @@ export function applyProjectOverrides(base: WardenConfig, raw: unknown): WardenC
   return { ...base, enabled, ...guards, prefs: applyPrefs(base.prefs, raw.prefs), warnings: [...(base.warnings ?? []), ...warnings] };
 }
 
+/** The variable that names the judgment backend for one process; it replaces the user file's typesafeBackend. */
+export const BACKEND_ENV = "PI_WARDEN_BACKEND";
+/** The managed default backend, a registry name applied only when the user file names none. */
+export const DEFAULT_BACKEND_ENV = "PI_WARDEN_DEFAULT_BACKEND";
+/** The managed default consent: "1" consents only while the user file records no choice of its own. */
+export const DEFAULT_CONSENT_ENV = "PI_WARDEN_DEFAULT_CONSENT";
+/** Whether an explicit PI_WARDEN_ENABLED grants consent: "1", as before, and the words a deployment's on-switch reads as on. */
+const CONSENT_GRANTS = ["1", "true", "yes", "on"];
+
+/** A trimmed environment value, or the empty string when the variable is unset or not a string. */
+const environmentValue = (env: NodeJS.ProcessEnv, name: string): string => {
+  const value = env[name];
+  return typeof value === "string" ? value.trim() : "";
+};
+
+/** A registry name replaces the backend; anything else turns judgments off with fixed text that never quotes the value. */
+function backendFromEnvironment(config: WardenConfig, env: NodeJS.ProcessEnv, name: string): WardenConfig {
+  const raw = environmentValue(env, name);
+  const backend = BACKEND_NAMES.includes(raw) ? resolveJudgmentBackend(raw) : undefined;
+  return backend?.typesafeBackend === undefined
+    ? { ...config, typesafeBackend: undefined, backendRefusal: `${name} must name one of ${BACKEND_NAMES.join(", ")}; its value was not used.` }
+    : { ...config, typesafeBackend: backend.typesafeBackend, backendRefusal: undefined };
+}
+
+/**
+ * The refusal for a user file that cannot be read as a JSON object while managed defaults are set. The file may
+ * withdraw consent, name a local judge, or keep project files from the judge, so judgments stay off until it is fixed
+ * or removed: neither a default nor PI_WARDEN_BACKEND stands in for it.
+ */
+export const UNREADABLE_REFUSAL = `${PACKAGE_NAME}/config.json cannot be read as a JSON object, so none of its settings can be honored; fix or remove it by hand to resume judgments.`;
+/** Why a write leaves such a file alone: replacing it would drop every setting in it unread. */
+export const UNREADABLE_WRITE = `${PACKAGE_NAME}/config.json cannot be read as a JSON object, so it was not changed; fix or remove it by hand first.`;
+
+/** Whether the user file records its own value for a key; null, which /warden config set can save, records none. */
+function fileSets(raw: unknown, key: string): boolean {
+  return isObject(raw) && raw[key] !== undefined && raw[key] !== null;
+}
+
+/**
+ * Managed defaults sit below the user file: each fills only a key the file does not set, so /warden enable,
+ * /warden disable, and a typesafeBackend saved in the file win over them. A file that turns pi-warden off with
+ * "enabled": false takes no default consent either, so a project file that turns the guards back on brings no
+ * judgments with them.
+ */
+export function applyManagedDefaults(config: WardenConfig, raw: unknown, env: NodeJS.ProcessEnv = process.env): WardenConfig {
+  const file = isObject(raw) ? raw : {};
+  let result = config;
+  if (!fileSets(file, "typesafe") && file.enabled !== false && environmentValue(env, DEFAULT_CONSENT_ENV) === "1")
+    result = { ...result, typesafe: true };
+  if (!fileSets(file, "typesafeBackend") && environmentValue(env, DEFAULT_BACKEND_ENV) !== "")
+    result = backendFromEnvironment(result, env, DEFAULT_BACKEND_ENV);
+  return result;
+}
+
+/** Whether either managed default is set, which is how a managed deployment runs pi-warden. */
+export function managedDefaultsSet(env: NodeJS.ProcessEnv = process.env): boolean {
+  return environmentValue(env, DEFAULT_CONSENT_ENV) !== "" || environmentValue(env, DEFAULT_BACKEND_ENV) !== "";
+}
+
+/**
+ * Unset or blank keeps the user file's choice. A registry name replaces it. Anything else turns judgments off, as a
+ * refused file value does: it never falls back to the file or to the default backend.
+ */
+export function applyBackendEnvironment(config: WardenConfig, env: NodeJS.ProcessEnv = process.env): WardenConfig {
+  return environmentValue(env, BACKEND_ENV) === "" ? config : backendFromEnvironment(config, env, BACKEND_ENV);
+}
+
+/**
+ * Whether an explicit PI_WARDEN_ENABLED withdraws consent in this process. Any nonblank value that does not grant
+ * it does, so a near-miss such as "off" or "false" fails closed instead of leaving a default in force.
+ */
+export function consentWithdrawn(env: NodeJS.ProcessEnv = process.env): boolean {
+  return environmentValue(env, "PI_WARDEN_ENABLED") !== "" && !consentGranted(env);
+}
+
+const consentGranted = (env: NodeJS.ProcessEnv): boolean => CONSENT_GRANTS.includes(environmentValue(env, "PI_WARDEN_ENABLED").toLowerCase());
+
+/**
+ * Whether judgments are consented in this process: an explicit PI_WARDEN_ENABLED decides first (1, true, yes, or on
+ * grants; any other nonblank value withdraws), then the loaded typesafe flag, which the user file sets and the
+ * managed default fills.
+ */
+export function judgmentConsent(config: WardenConfig, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (consentWithdrawn(env)) return false;
+  return consentGranted(env) || config.typesafe === true;
+}
+
+/** Where consent comes from, for status lines: the variable, the user file, the managed default, or undefined. */
+export function consentOrigin(config: WardenConfig, raw: unknown, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (!judgmentConsent(config, env)) return undefined;
+  if (consentGranted(env)) return "PI_WARDEN_ENABLED";
+  return fileSets(raw, "typesafe") ? "/warden enable" : DEFAULT_CONSENT_ENV;
+}
+
+/** What /warden enable and /warden disable add when an explicit PI_WARDEN_ENABLED holds this process on the other side. */
+export function explicitConsentNote(saved: boolean, env: NodeJS.ProcessEnv = process.env): string {
+  if (saved && consentWithdrawn(env)) return " An exported PI_WARDEN_ENABLED still withdraws consent in this process.";
+  if (!saved && consentGranted(env)) return " An exported PI_WARDEN_ENABLED still consents in this process.";
+  return "";
+}
+
+/**
+ * The variable that chose the backend, for status lines and the enable refusal, or undefined when the user file or
+ * the default did. An unreadable user file is the origin of its own refusal.
+ */
+export function backendOrigin(raw: unknown, env: NodeJS.ProcessEnv = process.env, config: WardenConfig | undefined = undefined): string | undefined {
+  if (config?.backendRefusal === UNREADABLE_REFUSAL) return undefined;
+  if (environmentValue(env, BACKEND_ENV) !== "") return BACKEND_ENV;
+  return !fileSets(raw, "typesafeBackend") && environmentValue(env, DEFAULT_BACKEND_ENV) !== "" ? DEFAULT_BACKEND_ENV : undefined;
+}
+
+/** Where the backend came from, for status lines: backendOrigin's variable, else the user file that names it. */
+export function backendSource(raw: unknown, env: NodeJS.ProcessEnv = process.env, config: WardenConfig | undefined = undefined): string | undefined {
+  const origin = backendOrigin(raw, env, config);
+  if (origin !== undefined || config?.backendRefusal !== undefined) return origin;
+  return fileSets(raw, "typesafeBackend") ? `${PACKAGE_NAME}/config.json` : undefined;
+}
+
+/** False only when the file is certainly absent: a dangling link or a directory that cannot be searched counts. */
+function fileMayExist(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code !== "ENOENT";
+  }
+}
+
 export interface LoadOptions {
   cwd?: string;
   /** Project overrides are applied only when the caller vouches for the project (Pi's trust decision). */
   projectTrusted?: boolean;
   /** Host directories; defaults to `defaultHostDirs()`. */
   dirs?: HostDirs;
+  /** The environment the managed defaults and overrides are read from; defaults to `process.env`. */
+  env?: NodeJS.ProcessEnv;
 }
 
 export function loadConfig(options: LoadOptions = {}): WardenConfig {
   const dirs = options.dirs ?? defaultHostDirs();
-  let config = applyUserOverrides(defaultConfig(), readJson(userConfigPath(dirs)));
+  const path = userConfigPath(dirs);
+  const raw = readJson(path);
+  const user = applyUserOverrides(defaultConfig(), raw);
+  let config = raw === undefined && managedDefaultsSet(options.env) && fileMayExist(path)
+    ? { ...user, typesafeBackend: undefined, backendRefusal: UNREADABLE_REFUSAL }
+    : applyBackendEnvironment(applyManagedDefaults(user, raw, options.env), options.env);
   if (options.cwd && options.projectTrusted) config = applyProjectOverrides(config, readJson(projectConfigPath(options.cwd, dirs)));
   return config;
 }
@@ -1240,6 +1390,8 @@ export function readUserConfig(dirs: HostDirs = defaultHostDirs()): Json {
 
 export function writeUserConfig(raw: Json, dirs: HostDirs = defaultHostDirs()): string {
   const path = userConfigPath(dirs);
+  // Never replace a file that may exist but cannot be read, since its settings would be lost unread.
+  if (readJson(path) === undefined && fileMayExist(path)) throw new Error(UNREADABLE_WRITE);
   writeFileAtomicSync(path, `${JSON.stringify(raw, null, 2)}\n`);
   return path;
 }
