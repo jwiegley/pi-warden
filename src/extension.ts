@@ -24,6 +24,7 @@ import { ArmingTracker, unparseableArmingRules } from "./arming.js";
 import * as configModule from "./config.js";
 import { applyUserOverrides, backendOrigin, backendSource, consentOrigin, consentWithdrawn, defaultConfig, explicitConsentNote, getNestedValue, isMode, judgmentConsent, loadConfig, PACKAGE_NAME, parseConfigValue, PROJECT_CONFIG_FILE, projectConfigPath, readUserConfig, setNestedValue, setUserSetting, UNREADABLE_REFUSAL, userConfigPath, writeUserConfig } from "./config.js";
 import type { WardenConfig, WardenMode } from "./config.js";
+import { activeContextEntries, latestCustomEntry, recentEntries, spineEntries } from "./history.js";
 import { classifyToolResult, doneNudge, emptyEvidence, evaluateDone, finalAssistantText, formatDone, isVisualCheck, needsDoneCheck, recordOutcome as recordDoneOutcome, recordUi } from "./done.js";
 import type { RunEvidence } from "./done.js";
 import { createdScratch, describeAsked, evaluateAction, formatVerdictTokens, higher, inertPathRules, intentSteer, largeOutputNotice, movedInTargets, offTaskSteer, pruneScratch, scratchCandidates, SCRATCH_PATHS_ENV, scratchPaths, shouldProceedMessage, SLOP_LABELS, SteerRepeatWindow, steerReason, stripDataText, unknownExemptIds, wardenHostPaths, writeSinkTargets, isVisibleCommand } from "./guard.js";
@@ -117,7 +118,7 @@ export function formatSteers(stats: { steers: number; steersSkipped: number; ste
 }
 
 function latestUserPrompt(ctx: ExtensionContext): string | undefined {
-  const entries = ctx.sessionManager.getBranch();
+  const entries = recentEntries(ctx, { type: "message", messageRole: "user", limit: 1 });
   for (let index = entries.length - 1; index >= 0; index--) {
     const entry = entries[index];
     if (entry?.type !== "message" || entry.message.role !== "user") continue;
@@ -130,7 +131,7 @@ function latestUserPrompt(ctx: ExtensionContext): string | undefined {
 
 /** Scope context only: approval still comes from latestUserPrompt, never from this history. */
 function recentTaskContext(ctx: ExtensionContext): TaskMessage[] {
-  const entries = ctx.sessionManager.getBranch();
+  const entries = recentEntries(ctx, { type: "message" });
   const messages: TaskMessage[] = [];
   let skippedLatestUser = false;
   for (let index = entries.length - 1; index >= 0 && messages.length < 8; index--) {
@@ -153,7 +154,7 @@ function recentTaskContext(ctx: ExtensionContext): TaskMessage[] {
  * numbered reply against what it points at; it explains the reply and never approves.
  */
 export function askedBeforeReply(ctx: ExtensionContext): string | undefined {
-  const entries = ctx.sessionManager.getBranch();
+  const entries = recentEntries(ctx, { type: "message" });
   const texts: string[] = [];
   let userSeen = false;
   for (let index = entries.length - 1; index >= 0; index--) {
@@ -173,7 +174,7 @@ export function askedBeforeReply(ctx: ExtensionContext): string | undefined {
  * so judging them one request at a time costs one round trip per call; judging them together costs one round trip.
  */
 export function siblingToolCalls(ctx: ExtensionContext): ToolCallRef[] {
-  const entries = ctx.sessionManager.getBranch();
+  const entries = recentEntries(ctx, { type: "message", limit: 1 });
   for (let index = entries.length - 1; index >= 0; index--) {
     const entry = entries[index];
     if (entry?.type !== "message") continue;
@@ -202,7 +203,7 @@ export function isVisibleAction(tool: string, input: Record<string, unknown>): b
  * after an older plan is the mismatch users object to. Sent as `plan`; it explains the step and cannot approve it.
  */
 export function assistantPlan(ctx: ExtensionContext, visibleAction = false): string | undefined {
-  const entries = ctx.sessionManager.getBranch();
+  const entries = recentEntries(ctx, { type: "message" });
   const plan = planForCall(entries);
   if (plan !== undefined || !visibleAction) return plan;
   for (let index = entries.length - 1; index >= 0; index--) {
@@ -785,7 +786,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
   const syncSeen = (ctx: ExtensionContext) => {
     const manager = ctx.sessionManager as Partial<ExtensionContext["sessionManager"]>;
     // Compaction-aware when the host has it: text a compaction summarized is no longer in context, so nothing may point to it.
-    const entries = typeof manager.buildContextEntries === "function" ? manager.buildContextEntries() : typeof manager.getBranch === "function" ? manager.getBranch() : [];
+    const entries = activeContextEntries(ctx);
     seenText.sync(entries.map(seenItem).filter(item => item !== undefined));
   };
   /** `text` with each run that repeats context replaced by a pointer line, or undefined when nothing repeats or the copy cannot be stored. */
@@ -839,7 +840,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
     }
     const command = typeof input.command === "string" ? input.command : JSON.stringify(input);
     let result = await filterOutput(text, {
-      tool, command, task: latestUserPrompt(ctx), spine: taskSpine(ctx.sessionManager.getBranch()), plan: assistantPlan(ctx),
+      tool, command, task: latestUserPrompt(ctx), spine: taskSpine(spineEntries(ctx)), plan: assistantPlan(ctx),
     }, { config: config.context.filter, judge, signal: ctx.signal });
     // Kept text is bounded by maxKeptChars; the gap markers are not, so the bound is checked on the result.
     if (result.ok && result.text.length > excerpt.length + config.context.filter.maxKeptChars) result = { ok: false, reason: "too_long", chunks: result.chunks, requests: result.requests, elapsedMs: result.elapsedMs };
@@ -1049,7 +1050,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
    */
   const checkSubagentReports = async (ctx: ExtensionContext, config: WardenConfig) => {
     if (!config.enabled || !config.subagent.enabled) return;
-    const reports = newReports(ctx.sessionManager.getBranch(), subagentSeen);
+    const reports = newReports(recentEntries(ctx, { type: "custom_message" }), subagentSeen);
     if (!reports.length) return;
     for (const report of reports) subagentSeen.add(report.id);
     stats.subagentReports += reports.length;
@@ -1195,8 +1196,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
     }
     const opening = configFor(ctx);
     // A resumed or reloaded session already carries the message; sending it again would repeat it in the context.
-    const openingBranch = typeof ctx.sessionManager?.getBranch === "function" ? ctx.sessionManager.getBranch() : [];
-    const prefsSent = openingBranch.some(entry => entry.type === "custom_message" && entry.customType === PREFS_TYPE);
+    const prefsSent = latestCustomEntry(ctx, PREFS_TYPE)?.type === "custom_message";
     if (opening.enabled && opening.prefs.enabled && opening.prefs.inject && !prefsSent) {
       try {
         const message = prefsMessage((await evaluatedPrefs(ctx)).items);
@@ -1206,7 +1206,10 @@ export default function wardenExtension(host: ExtensionAPI): void {
         console.warn("pi-warden: standing preferences scan failed:", error instanceof Error ? error.message : String(error));
       }
     }
-    if (opening.enabled && _event.reason === "resume") await announceLoops(ctx, opening, openingBranch);
+    if (opening.enabled && _event.reason === "resume") {
+      const loopsEntry = latestCustomEntry(ctx, LOOPS_TYPE);
+      await announceLoops(ctx, opening, loopsEntry ? [loopsEntry] : []);
+    }
   });
 
   /**
@@ -1252,8 +1255,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
     }
     const rules = curatedRuleList(set.rules);
     const myPrompt = promptEpoch;
-    const branch = typeof ctx.sessionManager?.getBranch === "function" ? ctx.sessionManager.getBranch() : [];
-    const request = buildCuratorRequest(prompt, taskSpine(branch, prompt), rules);
+    const request = buildCuratorRequest(prompt, taskSpine(spineEntries(ctx), prompt), rules);
     const started = Date.now();
     void ask(judge, request, { timeoutMs: Math.min(config.timeoutMs, CURATOR_TIMEOUT_MS), ...(ctx.signal ? { signal: ctx.signal } : {}) })
       .then(answer => {
@@ -1389,10 +1391,9 @@ export default function wardenExtension(host: ExtensionAPI): void {
         const redactedPrompt = redact(event.prompt).slice(0, 2000);
         const truncationRecorded = event.prompt.length > 2000 ? [`prompt truncated from ${event.prompt.length} to 2000 chars`] : [];
         // Build recent context from session branch (up to 4 messages, 500 chars each)
-        const branch = typeof ctx.sessionManager?.getBranch === "function" ? ctx.sessionManager.getBranch() : [];
-        const spine = taskSpine(branch, event.prompt);
+        const spine = taskSpine(spineEntries(ctx), event.prompt);
         const recentMessages: Array<{ role: string; text: string }> = [];
-        for (const entry of branch.slice(-6)) {
+        for (const entry of recentEntries(ctx, { limit: 6 })) {
           if (recentMessages.length >= 4) break;
           const msg = entry.type === "message" ? entry.message : undefined;
           if (msg && (msg.role === "user" || msg.role === "assistant") && typeof msg.content === "string") {
@@ -1587,8 +1588,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
           const myGeneration = conscienceGeneration;
           const prompt = typeof event.message.content === "string" ? event.message.content : "";
           const redactedText = redact(prompt).slice(0, 2000);
-          const branch = typeof ctx.sessionManager?.getBranch === "function" ? ctx.sessionManager.getBranch() : [];
-          const spine = taskSpine(branch, prompt);
+          const spine = taskSpine(spineEntries(ctx), prompt);
           let toolInfos: Array<{ name: string; description: string }> = [];
           try { toolInfos = pi.getAllTools().map((t: { name: string; description: string }) => ({ name: t.name, description: t.description })); } catch { toolInfos = []; }
           const activeSkills = cachedSkills.map(s => s.name);
@@ -1671,7 +1671,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
         try { toolInfos = pi.getAllTools().map((t: { name: string; description: string }) => ({ name: t.name, description: t.description })); } catch { toolInfos = []; }
         const prompt = latestUserPrompt(ctx);
         const redactedPrompt = redact(prompt ?? "").slice(0, 2000);
-        const spine = taskSpine(typeof ctx.sessionManager?.getBranch === "function" ? ctx.sessionManager.getBranch() : [], prompt ?? undefined);
+        const spine = taskSpine(spineEntries(ctx), prompt ?? undefined);
         const activeSkills = cachedSkills.map(s => s.name);
         const judgeAdapter = judge ? { evaluate: async (req: { state: unknown; questions: import("pi-typesafe").Questions }) => { const r = await judge.evaluate(req as Parameters<typeof judge.evaluate>[0]); return { answers: r.answers as Record<string, unknown> }; } } : undefined;
         try {
@@ -1786,7 +1786,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
     for (const { check } of rulesChecks) check.catch(() => undefined);
     const verdict = await actionGuard.inspect(
       call,
-      { task, context: recentTaskContext(ctx), siblings, plan: assistantPlan(ctx, isVisibleAction(event.toolName, event.input as Record<string, unknown>)), spine: taskSpine(ctx.sessionManager.getBranch()), asked: askedBeforeReply(ctx) },
+      { task, context: recentTaskContext(ctx), siblings, plan: assistantPlan(ctx, isVisibleAction(event.toolName, event.input as Record<string, unknown>)), spine: taskSpine(spineEntries(ctx)), asked: askedBeforeReply(ctx) },
       { config: config.action, cwd: ctx.cwd, judge, signal: ctx.signal, slop: config.slop, security: config.security, largeOutput: config.context.largeOutput, rules: config.rules, previousActions: regretCandidates.length ? regretCandidates : undefined, scratch: sessionScratch, scratchPaths: sessionScratchPaths, movedIn: sessionMovedIn.size ? [...sessionMovedIn] : undefined, hostPaths: sessionHostPaths },
     );
     if (verdict.source === "skipped") return;
@@ -2498,7 +2498,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
         previousSummary: preparation.previousSummary,
         fileOps: preparation.fileOps,
         task,
-        spine: taskSpine(ctx.sessionManager.getBranch(), task),
+        spine: taskSpine(spineEntries(ctx), task),
         focus: event.customInstructions,
       }, {
         judge, config: config.compaction, signal: event.signal, savedPathFor: text => ledger.storedPathIn(text),
@@ -2618,7 +2618,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
       try { toolInfos = pi.getAllTools().map((t: { name: string; description: string }) => ({ name: t.name, description: t.description })); } catch { toolInfos = []; }
       const prompt = latestUserPrompt(ctx);
       const redactedPrompt = redact(prompt ?? "").slice(0, 2000);
-      const spine = taskSpine(typeof ctx.sessionManager?.getBranch === "function" ? ctx.sessionManager.getBranch() : [], prompt ?? undefined);
+      const spine = taskSpine(spineEntries(ctx), prompt ?? undefined);
       const activeSkills = cachedSkills.map(s => s.name);
       let judgeModel = "";
       const judgeAdapter = judge ? { evaluate: async (req: { state: unknown; questions: import("pi-typesafe").Questions }) => { const r = await judge.evaluate(req as Parameters<typeof judge.evaluate>[0]); judgeModel = r.model; return { answers: r.answers as Record<string, unknown> }; } } : undefined;
