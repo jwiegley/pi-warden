@@ -178,8 +178,8 @@ test("evaluateTurnRun: a sed -i change no per-edit guard saw is judged with the 
   const config = rulesConfig();
   const snapshot = await snapshotTree(repo);
   assert.ok(snapshot.tree);
-  const platformArgs = process.platform === "darwin" ? ["-i", "", "-e", "s/changed by sed/one/", "b.txt"] : ["-i", "-e", "s/changed by sed/one/", "b.txt"];
-  execFileSync("sed", platformArgs, { cwd: repo, stdio: "pipe" });
+  execFileSync("sed", ["-i.bak", "-e", "s/changed by sed/one/", "b.txt"], { cwd: repo, stdio: "pipe" });
+  await rm(join(repo, "b.txt.bak"));
   const judge = stubJudge({ "no-console-statements": 0.9 });
   const run = await evaluateTurnRun({ cwd: repo, config, set: editOnly as never, judge, timeoutMs: 1000, task: "fix b", startTree: snapshot.tree!, alreadyJudged: new Set() });
   assert.deepEqual(run.verdicts.map(verdict => [verdict.tool, verdict.path]), [["edit", "b.txt"]], "the sed -i file is judged as one edit of its diff");

@@ -885,6 +885,21 @@ test("assess handles judge timeout gracefully", async () => {
   assert.equal(result.skipReason, "error", "should return error on timeout");
 });
 
+test("assess reports a deadline exhausted before the judge starts", async () => {
+  let clockReads = 0;
+  let calls = 0;
+  const result = await assess("verify the numbers", "", defaultSkills, defaultTools, [], [], {
+    judge: { evaluate: async () => { calls++; return { answers: {} }; } },
+    config: fakeConfig({ timeoutMs: 10 }),
+    sharedTimeoutMs: 5000,
+    now: () => clockReads++ === 0 ? 0 : 11,
+  });
+  assert.equal(calls, 0, "an expired budget must not start a request");
+  assert.equal(result.requestCount, 0);
+  assert.equal(result.skipReason, "error");
+  assert.equal(result.errorCategory, "timeout");
+});
+
 test("assess handles judge throwing gracefully", async () => {
   const throwingJudge: Judge = {
     evaluate: async () => { throw new Error("network error"); },
