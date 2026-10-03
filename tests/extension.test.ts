@@ -3027,7 +3027,7 @@ test("/warden enable without a key asks for one after consent, verifies it, stor
     assert.ok(networkCalls >= 1, "the stored key powers judgments in the same session");
 
     await runCommand("status");
-    assert.match(notices.at(-1)!.text, /consented via \/warden enable; TypeSafe key: \/typesafe login \(verified/);
+    assert.match(notices.at(-1)!.text, /consented via \/warden enable; TypeSafe key: the key saved by \/warden enable \(verified/);
   } finally {
     process.env.TYPESAFE_API_KEY = "offline-test-key";
   }
@@ -4990,7 +4990,7 @@ test("judgments off: each reason is said once per session with its fix, and work
     await sessionStart();
     await toolCall("bash", { command: "npm test" });
     await toolCall("bash", { command: "npm run lint" });
-    assert.deepEqual(judgmentsOff(), ["warden: Jev judgments are off (no key for typesafe). Set TYPESAFE_API_KEY or run /typesafe login."]);
+    assert.deepEqual(judgmentsOff(), ["warden: Jev judgments are off (no key for typesafe). Set TYPESAFE_API_KEY or run /warden enable."]);
   } finally {
     process.env.TYPESAFE_API_KEY = savedTestKey;
   }
@@ -5012,13 +5012,13 @@ test("judgments off: each reason is said once per session with its fix, and work
   assert.deepEqual(judgmentsOff(), [], "a session with working judgments shows no notice");
 });
 
-test("judgments off: no key on OpenRouter names its variable and its own /typesafe login", async () => {
+test("judgments off: no key on OpenRouter names its variable and pi-warden's own login", async () => {
   await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: "openrouter", rules: { enabled: false }, ...STACK_BAR }));
   const savedOpenRouter = process.env.OPENROUTER_API_KEY;
   delete process.env.OPENROUTER_API_KEY;
   try {
     await toolCall("bash", { command: "npm test" });
-    assert.deepEqual(judgmentsOff(), ["warden: Jev judgments are off (no key for openrouter). Set OPENROUTER_API_KEY or run /typesafe login openrouter."]);
+    assert.deepEqual(judgmentsOff(), ["warden: Jev judgments are off (no key for openrouter). Set OPENROUTER_API_KEY or run /warden enable."]);
     assert.equal(networkCalls, 0);
   } finally {
     if (savedOpenRouter !== undefined) process.env.OPENROUTER_API_KEY = savedOpenRouter;
@@ -5118,7 +5118,7 @@ test("judgments off: no key on a custom endpoint names its own key variable and 
   assert.equal(networkCalls, 0);
 });
 
-test("judgments off: a rejected key saved by /typesafe login is named as that key, and the notice never shows it", async () => {
+test("judgments off: a rejected key saved by /warden enable is named as that key, and the notice never shows it", async () => {
   await grantConsent();
   const savedTestKey = process.env.TYPESAFE_API_KEY;
   delete process.env.TYPESAFE_API_KEY;
@@ -5128,7 +5128,7 @@ test("judgments off: a rejected key saved by /typesafe login is named as that ke
     await sessionStart();
     await toolCall("bash", { command: "npm test" });
     await toolCall("bash", { command: "npm run lint" });
-    assert.deepEqual(judgmentsOff(), ["warden: Jev judgments are off (the key saved by /typesafe login was rejected). Run /typesafe login."]);
+    assert.deepEqual(judgmentsOff(), ["warden: Jev judgments are off (the key saved by /warden enable was rejected). Delete pi-typesafe/auth.json, then run /warden enable."]);
     assert.ok(!judgmentsOff()[0]!.includes("stored-test-key"));
     assert.equal(networkCalls, 0);
   } finally {

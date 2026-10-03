@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { DECISIONS_BACKENDS, TypeSafeIntegrationError, createTypeSafe, noul, openUsageLedger } from "pi-typesafe";
-import { backendName, describeBackend, disclosureFor, judgeOptions, loginStoresKey, resolveJudgmentBackend } from "../src/backend.js";
+import { LOGIN_HINT, backendName, describeBackend, disclosureFor, judgeOptions, loginStoresKey, resolveJudgmentBackend } from "../src/backend.js";
 
 const gateway = { label: "Acme judge gateway", host: "https://gw.acme.example", path: "/judge/v1/decide", keyEnv: "ACME_JUDGE_KEY", defaultModel: "jev-1.13" };
 
@@ -85,6 +85,18 @@ test("judgeOptions: commandcode and openrouter are forwarded as names", () => {
 test("judgeOptions: an endpoint object reaches createTypeSafe unchanged", () => {
   const opts = judgeOptions({ maxRequests: 10, timeoutMs: 3000, typesafeBackend: gateway });
   assert.equal(opts.backend, gateway);
+});
+
+test("judgeOptions carries the login hint, so pi-typesafe names pi-warden's own command", () => {
+  assert.equal(LOGIN_HINT, "/warden enable");
+  const openrouter = judgeOptions({ maxRequests: 12, timeoutMs: 5000, typesafeBackend: "openrouter" });
+  assert.equal(openrouter.loginHint, LOGIN_HINT);
+  assert.equal(openrouter.backend, "openrouter");
+  assert.equal(openrouter.maxRequests, 12);
+  assert.equal(openrouter.timeoutMs, 5000);
+  const typesafe = judgeOptions({ maxRequests: 12, timeoutMs: 5000, typesafeBackend: "typesafe" });
+  assert.equal(typesafe.backend, undefined, "the default backend is left to pi-typesafe");
+  assert.equal(typesafe.loginHint, LOGIN_HINT);
 });
 
 test("judgeOptions carries no fetch on either runtime, so the body replay stays pi-typesafe's job", () => {
