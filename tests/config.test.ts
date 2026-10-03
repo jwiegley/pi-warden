@@ -243,6 +243,9 @@ test("loadConfig merges user then trusted project file, and survives malformed f
 
   await writeFile(path, "{ not json");
   assert.equal(loadConfig().typesafe, false, "malformed user file falls back to defaults");
+  assert.throws(() => setUserSetting("typesafe", true), /cannot be read as a JSON object/, "a setter refuses to replace a file it cannot read");
+  assert.equal(await readFile(path, "utf8"), "{ not json", "the malformed file is left as it was");
+  await rm(path);
   setUserSetting("typesafe", true);
   setUserSetting("enabled", false);
   assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { typesafe: true, enabled: false });
