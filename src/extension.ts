@@ -13,7 +13,7 @@ const MouseRegion: MouseRegionConstructor | undefined = (tuiModule as Partial<{ 
 import { authState, backendHost, createTypeSafe, describeAuth, resolveBackend, ask } from "pi-typesafe";
 import type { TypeSafe } from "pi-typesafe";
 import { ensureApiKey } from "pi-typesafe/ui";
-import { backendName, describeBackend, disclosureFor, judgeOptions, loginStoresKey } from "./backend.js";
+import { LOGIN_HINT, backendName, describeBackend, disclosureFor, judgeOptions, loginStoresKey } from "./backend.js";
 import type { BackendSetting, JudgmentsOffReason } from "./backend.js";
 import { ActionGuard } from "./action-guard.js";
 import { adaptHost } from "./host-compat.js";
@@ -247,8 +247,8 @@ function planForCall(entries: ReturnType<ExtensionContext["sessionManager"]["get
 
 /**
  * The once-per-session notice: why Jev judgments are off and what turns them on. `rejectedEnv` is the environment
- * variable that holds a rejected key, or undefined when the rejected key is the one `/typesafe login` saved. Never
- * names a key value or a path.
+ * variable that holds a rejected key, or undefined when the rejected key is the one `/warden enable` saved. Never
+ * names a key value or an absolute path.
  */
 export function judgmentsOffText(reason: Exclude<JudgmentsOffReason, "budget">, setting: BackendSetting, headless: boolean, rejectedEnv?: string): string {
   switch (reason) {
@@ -258,10 +258,10 @@ export function judgmentsOffText(reason: Exclude<JudgmentsOffReason, "budget">, 
     case "bad_backend": return setting.backendRefusal === UNREADABLE_REFUSAL
       ? `warden: Jev judgments are off (${UNREADABLE_REFUSAL})`
       : `warden: Jev judgments are off (typesafeBackend refused: ${setting.backendRefusal ?? "the configured value is not usable"})`;
-    case "no_key": return `warden: Jev judgments are off (no key for ${backendName(setting.typesafeBackend)}). Set ${resolveBackend(setting.typesafeBackend).keyEnv}${loginStoresKey(setting.typesafeBackend) ? " or run /typesafe login" : ""}.`;
+    case "no_key": return `warden: Jev judgments are off (no key for ${backendName(setting.typesafeBackend)}). Set ${resolveBackend(setting.typesafeBackend).keyEnv}${loginStoresKey(setting.typesafeBackend) ? " or run /warden enable" : ""}.`;
     case "key_rejected": return rejectedEnv
       ? `warden: Jev judgments are off (the key in ${rejectedEnv} was rejected). Check the key, then run /warden status.`
-      : "warden: Jev judgments are off (the key saved by /typesafe login was rejected). Run /typesafe login.";
+      : "warden: Jev judgments are off (the key saved by /warden enable was rejected). Delete pi-typesafe/auth.json, then run /warden enable.";
   }
 }
 
@@ -620,7 +620,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
     if (config.backendRefusal !== undefined || backend === undefined) return "bad_backend";
     if (!consentGiven(config)) return "no_consent";
     if (budgetExhausted) return "budget";
-    const auth = authState({ backend });
+    const auth = authState({ backend, loginHint: LOGIN_HINT });
     if (auth.usable) return undefined;
     // No key in effect, or one whose last request came back 401 or 403.
     return auth.source === undefined ? "no_key" : "key_rejected";
@@ -635,7 +635,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
     // The budget has its own notice in noteError.
     if (reason === undefined || reason === "budget" || judgmentsReported.has(reason)) return;
     judgmentsReported.add(reason);
-    const auth = reason === "key_rejected" && config.typesafeBackend !== undefined ? authState({ backend: config.typesafeBackend }) : undefined;
+    const auth = reason === "key_rejected" && config.typesafeBackend !== undefined ? authState({ backend: config.typesafeBackend, loginHint: LOGIN_HINT }) : undefined;
     judgmentsNotify?.(judgmentsOffText(reason, config, judgmentsHeadless, auth?.kind === "environment" ? auth.keyName : undefined));
   };
   const consentSource = (config: WardenConfig) => consentOrigin(config, readUserConfig(dirs));
@@ -2824,7 +2824,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
         if (action === "status") {
           // A refused backend has no key to describe; the refusal itself is the status line.
           const backend = config.typesafeBackend;
-          const auth = config.backendRefusal !== undefined || backend === undefined ? undefined : describeAuth(authState({ backend }));
+          const auth = config.backendRefusal !== undefined || backend === undefined ? undefined : describeAuth(authState({ backend, loginHint: LOGIN_HINT }), LOGIN_HINT);
           const source = consentSource(config);
           const backendFrom = backendSource(readUserConfig(dirs), process.env, config);
           const usage = client?.getUsage();
@@ -3091,7 +3091,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
           if (!await ctx.ui.confirm("Enable TypeSafe judgments for pi-warden?", consentText)) return;
           // One flow: consent, then a key if none is configured yet. TypeSafe prompts, verifies, and stores the key for every
           // pi-typesafe consumer; any other backend has no login, so a missing key is reported with the variable to set.
-          const key = await ensureApiKey(ctx, backend === undefined ? {} : { backend });
+          const key = await ensureApiKey(ctx, { ...(backend === undefined ? {} : { backend }), loginHint: LOGIN_HINT });
           if (!key) { report("No key entered; pi-warden stays on pattern checks only. Run /warden enable again when you have a key from console.typesafe.ai.", "warning"); return; }
           const path = setUserSetting("typesafe", true, dirs);
           client = undefined;
@@ -3177,7 +3177,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
         }
         if (action === "audit") {
           if (!ctx.hasUI) { report("Audit needs an interactive session to run.", "warning"); return; }
-          if (!await ctx.ui.confirm("Run workspace audit?", `This runs an agent-driven audit of ${redact(ctx.cwd)}. It uses the session model, reads source code, and writes a report. It may take several minutes and use real tokens. Measured comparisons need the agent's TypeSafe tool, which is enabled per session with \`/typesafe enable\`; without it findings will be marked unmeasured.`)) return;
+          if (!await ctx.ui.confirm("Run workspace audit?", `This runs an agent-driven audit of ${redact(ctx.cwd)}. It uses the session model, reads source code, and writes a report. It may take several minutes and use real tokens. Measured comparisons need pi-typesafe's TypeSafe tool, which pi-warden does not load, so findings will be marked unmeasured.`)) return;
           const projects = findProjects(ctx.cwd);
           const prompt = buildAuditPrompt(ctx.cwd, projects);
           const reportPath = join(ctx.cwd, ".pi-warden", "audit-report.html");

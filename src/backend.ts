@@ -43,7 +43,14 @@ export function backendName(backend: JudgmentBackend | undefined): string {
   return backend === undefined ? DEFAULT_BACKEND : typeof backend === "string" ? backend : resolveBackend(backend).label;
 }
 
-/** Whether the backend takes the TypeSafe key, the only one `/typesafe login` stores; true only for "typesafe". */
+/**
+ * How pi-warden names its own login in every hint: the command it registers for consent, a key, and the TypeSafe key
+ * store. It reaches pi-typesafe as `loginHint`, because pi-warden uses pi-typesafe as a library and never loads the
+ * extension that registers `/typesafe`, so every message pi-typesafe writes must name this command instead.
+ */
+export const LOGIN_HINT = "/warden enable";
+
+/** Whether the backend takes the TypeSafe key, the only one the TypeSafe login store holds; true only for "typesafe". */
 export function loginStoresKey(backend: JudgmentBackend | undefined): boolean {
   return backend === DEFAULT_BACKEND;
 }
@@ -67,6 +74,7 @@ export function judgeOptions(config: { maxRequests: number; timeoutMs: number; t
   return {
     maxRequests: config.maxRequests,
     timeoutMs: config.timeoutMs,
+    loginHint: LOGIN_HINT,
     ...(config.typesafeBackend === DEFAULT_BACKEND ? {} : { backend: config.typesafeBackend }),
   };
 }

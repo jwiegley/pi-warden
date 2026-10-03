@@ -5,6 +5,10 @@ import { join } from "node:path";
 import { after, before, beforeEach, test } from "node:test";
 import { ConfigPanel } from "../src/panel.js";
 import { judgmentsOffText } from "../src/extension.js";
+import { buildAuditPrompt } from "../src/audit.js";
+import { LOGIN_HINT } from "../src/backend.js";
+import { authState, describeAuth } from "pi-typesafe";
+import { ensureApiKey } from "pi-typesafe/ui";
 import {
   BACKEND_ENV, DEFAULT_BACKEND_ENV, DEFAULT_CONSENT_ENV, UNREADABLE_REFUSAL, UNREADABLE_WRITE,
   applyBackendEnvironment, applyManagedDefaults, applyProjectOverrides, applyUserOverrides, backendSource, consentOrigin,
@@ -189,4 +193,30 @@ test("the once-per-session notice says why judgments are off", () => {
   } finally {
     delete process.env.PI_WARDEN_ENABLED;
   }
+});
+
+test("every hint pi-warden writes names its own login, and pi-typesafe's text follows it", async () => {
+  const setting = { typesafeBackend: "typesafe" as const, backendRefusal: undefined };
+  assert.match(judgmentsOffText("no_key", setting, false), /or run \/warden enable\./);
+  assert.doesNotMatch(judgmentsOffText("no_key", setting, false), /\/typesafe/);
+  assert.match(judgmentsOffText("key_rejected", setting, false), /key saved by \/warden enable/);
+  assert.doesNotMatch(judgmentsOffText("key_rejected", setting, false), /\/typesafe/);
+
+  // pi-typesafe writes the status line and the login refusal; the hint is how they name pi-warden's command.
+  const status = describeAuth(authState({ backend: "typesafe", loginHint: LOGIN_HINT }), LOGIN_HINT);
+  assert.match(status.text, /\/warden enable or TYPESAFE_API_KEY/);
+  assert.doesNotMatch(status.text, /\/typesafe/);
+  const savedOpenrouter = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  try {
+    await assert.rejects(
+      ensureApiKey({ hasUI: true } as never, { backend: "openrouter", loginHint: LOGIN_HINT }),
+      (error: unknown) => error instanceof Error && /\/warden enable stores a TypeSafe key only/.test(error.message),
+    );
+  } finally {
+    if (savedOpenrouter === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = savedOpenrouter;
+  }
+
+  // The audit prompt asks for a tool pi-warden does not load, and no longer sends the agent after a command that is not there.
+  assert.doesNotMatch(buildAuditPrompt(process.cwd(), []), /\/typesafe/);
 });
