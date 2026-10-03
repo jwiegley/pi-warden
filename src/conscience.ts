@@ -769,14 +769,11 @@ export async function assess(
     const state = buildState(prompt, recentContext, activeSkills, suppliedSkills, opaqueBatch, spine);
 
     const remaining = deadline - (deps.now?.() ?? Date.now());
-    if (remaining <= 0) {
-      fail();
-      return;
-    }
 
     let answers: Record<string, unknown>;
     const j = judge!;
     try {
+      if (remaining <= 0) throw new Error("timeout");
       const result = await Promise.race([
         j.evaluate({ state, questions }),
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), remaining)),

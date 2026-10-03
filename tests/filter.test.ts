@@ -119,11 +119,20 @@ test("chunk text, task, plan, and command are redacted before they leave", () =>
 test("the filter keeps the useful passages word for word, in order, with the tail, and runs batches in parallel", async () => {
   const text = log(1200, [100, 700]);
   const sent: Request[] = [];
-  const started = Date.now();
-  const result = await filterOutput(text, input, { config: config(), judge: fakeJudge(needle, sent, 100) });
+  const judge = fakeJudge(needle, sent);
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const concurrent: Judge = { async evaluate(request, options) {
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    try { return await judge.evaluate(request, options); }
+    finally { inFlight--; }
+  } };
+  const result = await filterOutput(text, input, { config: config(), judge: concurrent });
   assert.ok(result.ok);
   assert.ok(sent.length >= 2);
-  assert.ok(Date.now() - started < 100 * sent.length, "batches run in parallel");
+  assert.equal(maxInFlight, sent.length, "all batches start before any completes");
   assert.equal(result.requests, sent.length);
   assert.equal(result.kept, 2);
   assert.match(result.text, new RegExp(`^\\[pi-warden: filtered; ${text.length} original characters, ${text.split("\n").length} lines\\. Passages selected for the current task; omitted text is in the full-output file\\.\\]\n\\[… \\d+ lines omitted …\\]\n`));
