@@ -11,6 +11,9 @@ import { claims, claimAudit, checksRun, finalAssistantText, gitFacts, toolCalls,
 function repo(files: Record<string, string>) {
   const dir = mkdtempSync(join(tmpdir(), "eval-score-"));
   execFileSync("git", ["-C", dir, "init", "-q"]);
+  // The evaluator's fixture format uses a/ and b/, not the developer's diff display preferences.
+  execFileSync("git", ["-C", dir, "config", "diff.mnemonicprefix", "false"]);
+  execFileSync("git", ["-C", dir, "config", "diff.noprefix", "false"]);
   execFileSync("git", ["-C", dir, "-c", "user.email=e@l", "-c", "user.name=e", "commit", "-q", "--allow-empty", "-m", "baseline"]);
   for (const [path, content] of Object.entries(files)) {
     mkdirSync(join(dir, path, ".."), { recursive: true });
