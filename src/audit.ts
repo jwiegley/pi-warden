@@ -66,7 +66,7 @@ export function buildAuditPrompt(cwd: string, projects: string[]): string {
     "   - Count the branches, keyword entries, or cases the current code handles",
     "   - Count cases it misses (e.g. grep for keywords it does not cover, list known false positives from comments or issues)",
     "   - Run the existing test suite and count pass/fail relevant to this code path",
-    "   - Write a throwaway script under the OS temp directory that feeds sample inputs through both the current code and a Jev question (using `typesafe_evaluate` when available in the session; this tool requires the operator to run `/typesafe enable` once per session — if a call fails with \"TypeSafe is disabled\", ask the operator once, and if it remains disabled, continue with the other evidence and mark those findings unmeasured)",
+    "   - Write a throwaway script under the OS temp directory that feeds sample inputs through both the current code and a Jev question (using `typesafe_evaluate` when available in the session; when it is not, continue with the other evidence and mark those findings unmeasured)",
     "",
     "   A finding without measurable comparison data must be marked **\"unmeasured\"** — do not dress it up.",
     "",
