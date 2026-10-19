@@ -67,7 +67,9 @@
     "eval:replay": "node scripts/rules-replay.mjs",
     "eval:rules": "node scripts/rules-bench.mjs",
     "eval:rules-turn": "node scripts/rules-turn-bench.mjs",
-    "eval:supervision": "node --import tsx --env-file-if-exists=.env scripts/supervision-calibrate.mjs"
+    "eval:supervision": "node --import tsx --env-file-if-exists=.env scripts/supervision-calibrate.mjs",
+    "prebuild": "node scripts/build-typesafe.mjs",
+    "pretypecheck": "node scripts/build-typesafe.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.85.1 <2",
@@ -89,6 +91,9 @@
     "typescript": "^6.0.0"
   },
   "dependencies": {
-    "pi-typesafe": "^0.13.1"
-  }
+    "pi-typesafe": "https://github.com/jwiegley/pi-typesafe/archive/afce85119af1b1e2e67ff21f9727bfb72fedf641.tar.gz"
+  },
+  "bundledDependencies": [
+    "pi-typesafe"
+  ]
 }
