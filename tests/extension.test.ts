@@ -6,18 +6,29 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, beforeEach, test, type TestContext } from "node:test";
-import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { createEventBus, DefaultResourceLoader, SettingsManager, type EventBus } from "@earendil-works/pi-coding-agent";
+import { createTypeSafe } from "pi-typesafe";
 import type { Extension, ExtensionContext, RegisteredCommand } from "@earendil-works/pi-coding-agent";
-import { initSchema, queryHoldsForProject } from "../src/learning.js";
+import { initSchema, queryHoldsForProject, recordCause } from "../src/learning.js";
 import { readRulesLog, rulesLogPath } from "../src/rules-log.js";
-import { defaultConfig } from "../src/config.js";
+import { defaultConfig, loadConfig } from "../src/config.js";
 import { policyMatches, CONSCIENCE_BETA_POLICY } from "../src/load.js";
 import { _testSetIndexRunning, askedBeforeReply, assistantPlan } from "../src/extension.js";
 import { SHELL_RULES_CHECKS } from "../src/turn-rules.js";
-import { indexPath } from "../src/index-cmd.js";
+import { indexPath, readIndex } from "../src/index-cmd.js";
 
 let temporary: string;
 let extension: Extension;
+const supervisionIds = ["is_repeating_without_progress", "is_failure_loop", "is_reading_beyond_reasonable_discovery", "has_material_progress", "is_safe_to_resume_after_failure"];
+const supervisionMetrics = () => ({ rootId: "root-1", role: "worker", lifecycle: "active", reason: null, continuationPlan: null,
+  observedCostUsd: 0.1, observerCostUsd: 0, softLimitUsd: 1, hardLimitUsd: 2, descendantCount: 0,
+  progress: { materialProgressCount: 1, readsSinceProgress: 0, writesSinceProgress: 0, repeatedOperationCount: 0, equivalentErrorCount: 0, lastOperationSignature: null, lastProgressAgeMs: 10 },
+  mcp: { state: "unknown", capabilityCount: null } });
+/** The producer's claim callback is a spy: the observer must never call it. */
+let supervisionClaims = 0;
+const emitSupervision = (metrics: unknown = supervisionMetrics(), bus = eventBus) => {
+  bus.emit("pi-subagents/supervision-evaluate/v1", { version: 1, metrics, claim: () => { supervisionClaims++; return false; } });
+};
 let command: RegisteredCommand;
 const savedKey = process.env.TYPESAFE_API_KEY;
 const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -27,6 +38,9 @@ const savedDb = process.env.PI_WARDEN_DB;
 const originalFetch = globalThis.fetch;
 
 const notices: Array<{ text: string; level: string }> = [];
+/** Events the extension emitted on the host bus, herdr:blocked included: (channel, payload). */
+const eventBus: EventBus = createEventBus();
+const busEvents: Array<{ channel: string; data: unknown }> = [];
 const widgets: Array<string[] | undefined> = [];
 const confirms: Array<{ title: string; message: string }> = [];
 let confirmResult = true;
@@ -185,9 +199,11 @@ const writeConfig = (json: string) => {
   const config = JSON.parse(json) as { action?: Record<string, unknown> };
   return writeFile(configPath(), JSON.stringify({ ...config, action: { ...FULL_ACTION, ...(config.action ?? {}) } }));
 };
-const grantConsent = () => writeConfig(JSON.stringify({ typesafe: true, notices: true, rules: { enabled: false }, ...STACK_BAR }));
+const grantConsent = () => writeConfig(JSON.stringify({ typesafe: true, notices: true, rules: { enabled: false }, cause: { enabled: false }, ...STACK_BAR }));
+/** Consent with the cause-check at its default (on), for tests whose subject is that guard. */
+const grantConsentCause = () => writeConfig(JSON.stringify({ typesafe: true, notices: true, rules: { enabled: false }, ...STACK_BAR }));
 /** Consent with the rules guard on: the turn-start reminder needs a rule set to ask about. */
-const curatorConfig = () => writeConfig(JSON.stringify({ typesafe: true, notices: true, rules: { enabled: true }, slop: { enabled: false }, done: { enabled: false }, ...STACK_BAR }));
+const curatorConfig = () => writeConfig(JSON.stringify({ typesafe: true, notices: true, rules: { enabled: true }, slop: { enabled: false }, done: { enabled: false }, cause: { enabled: false }, ...STACK_BAR }));
 
 before(async () => {
   temporary = await mkdtemp(join(tmpdir(), "pi-warden-ext-"));
@@ -244,10 +260,12 @@ before(async () => {
     cwd: temporary,
     agentDir: join(temporary, "agent"),
     settingsManager: SettingsManager.inMemory(),
+    eventBus,
     noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
     additionalExtensionPaths: [resolve("src/extension.ts")],
   });
   await loader.reload();
+  eventBus.on("herdr:blocked", (data: unknown) => { busEvents.push({ channel: "herdr:blocked", data }); });
   const result = loader.getExtensions();
   assert.deepEqual(result.errors, [], "native Pi loader must accept the extension");
   const loaded = result.extensions[0];
@@ -264,16 +282,22 @@ before(async () => {
 
 beforeEach(async () => {
   testStartedAt = Date.now();
-  notices.length = 0; widgets.length = 0; confirms.length = 0;
+  notices.length = 0; widgets.length = 0; confirms.length = 0; busEvents.length = 0;
   confirmResult = true; editorText = undefined; networkCalls = 0; failNetwork = false; hangNetwork = false; failStatus = undefined; prompt = "Run the test suite";
   keyPrompts = 0; keyInput = undefined; modelListCalls = 0; sentMessages.length = 0; requests.length = 0; requestUrls.length = 0; requestAuth.length = 0;
-  answeredRequests = 0; judgeGate = undefined; releaseJudge = undefined;
+  answeredRequests = 0; supervisionClaims = 0; judgeGate = undefined; releaseJudge = undefined;
   widgetComponent = undefined; widgetPlacement = undefined; customCalls.length = 0; openPanels.length = 0; panelClosed.length = 0; renders = 0;
   await rm(join(temporary, "agent", "pi-typesafe"), { recursive: true, force: true });
   nextAnswers = { irreversible: 0.1, off_task: 0.1, scope: "expected_step" };
   nextModel = "jev-1.13.0";
   await rm(configPath(), { force: true });
   await sessionStart();
+  // The cause-check remembers unchecked causes in the shared database; a test starts from an empty history.
+  {
+    const db = new DatabaseSync(process.env.PI_WARDEN_DB!);
+    try { db.exec("DELETE FROM causes"); } catch { /* the table is created by schema init */ }
+    db.close();
+  }
   widgets.length = 0;
 });
 
@@ -287,11 +311,101 @@ after(async () => {
   if (temporary) await rm(temporary, { recursive: true, force: true });
 });
 
-test("PI_WARDEN_DB is set and not under the real home directory", () => {
+test("the observer records one five-question request without rootId and never claims", async () => {
+  await grantConsent();
+  const dir = join(temporary, "observer-record");
+  process.env.PI_WARDEN_TRACE_DIR = dir;
+  try {
+    await sessionStart();
+    emitSupervision();
+    await waitFor(() => answeredRequests === 1, "observer request");
+    assert.equal(supervisionClaims, 0, "the observer never claims the event");
+    assert.equal(requests.length, 1);
+    assert.deepEqual(Object.keys(requests[0]!.questions), supervisionIds);
+    assert.equal("rootId" in requests[0]!.state, false, "rootId stays local");
+    assert.equal(sentMessages.length, 0);
+    const records = await readLog(join(dir, `${process.pid}.jsonl`), 2, false);
+    const entry = records.find(record => record.kind === "entry")!;
+    assert.equal(entry.guard, "subagent");
+    const details = entry.details as string[];
+    for (const id of supervisionIds) assert.ok(details.some(detail => detail.startsWith(`${id}: `)), `${id} is recorded`);
+    assert.ok(details.some(detail => detail.startsWith("model: ") && detail.includes("jev-1.13.0")), "the answering model is recorded");
+  } finally {
+    delete process.env.PI_WARDEN_TRACE_DIR;
+  }
+});
+
+test("the observer sends nothing when subagent.observer is off", async () => {
+  await writeConfig(JSON.stringify({ typesafe: true, subagent: { observer: false } }));
+  await sessionStart();
+  emitSupervision();
+  await tick();
+  assert.equal(requests.length, 0);
+  assert.equal(supervisionClaims, 0);
+});
+
+test("the observer sends nothing for an invalid event", async () => {
+  await grantConsent();
+  await sessionStart();
+  emitSupervision({ ...supervisionMetrics(), path: "/private" });
+  await tick();
+  assert.equal(requests.length, 0);
+});
+
+test("the observer sends nothing once the shared request budget is spent", async () => {
+  await writeConfig(JSON.stringify({ typesafe: true, maxRequests: 1 }));
+  await sessionStart();
+  emitSupervision();
+  await waitFor(() => answeredRequests === 1, "first observer request");
+  const answered = requests.length;
+  emitSupervision();
+  await tick();
+  assert.equal(requests.length, answered, "an exhausted budget makes no second request");
+});
+
+test("a Jev error is recorded with its reason and never throws", async () => {
+  await grantConsent();
+  failStatus = 503;
+  const dir = join(temporary, "observer-error");
+  process.env.PI_WARDEN_TRACE_DIR = dir;
+  try {
+    await sessionStart();
+    emitSupervision();
+    await waitFor(() => networkCalls === 1, "failed observer request");
+    const records = await readLog(join(dir, `${process.pid}.jsonl`), 2, false);
+    const entry = records.find(record => record.kind === "entry")!;
+    assert.equal(entry.guard, "subagent");
+    const failed = (entry.details as string[]).find(detail => detail.startsWith("failed: "));
+    assert.ok(failed, "the failure reason is recorded");
+    assert.ok(failed.includes("TypeSafe returned HTTP 503"), "the recorded detail contains the judge error");
+    assert.equal(notices.length, 0, "a quiet observer failure sends no notice");
+    assert.equal(sentMessages.length, 0);
+  } finally {
+    delete process.env.PI_WARDEN_TRACE_DIR;
+  }
+});
+
+test("an answer from a model other than the calibration model is recorded", async () => {
+  await grantConsent();
+  nextModel = "jev-9.9.9";
+  const dir = join(temporary, "observer-model");
+  process.env.PI_WARDEN_TRACE_DIR = dir;
+  try {
+    await sessionStart();
+    emitSupervision();
+    await waitFor(() => answeredRequests === 1, "observer request");
+    const records = await readLog(join(dir, `${process.pid}.jsonl`), 2, false);
+    const entry = records.find(record => record.kind === "entry")!;
+    assert.ok((entry.details as string[]).some(detail => detail.startsWith("model: jev-9.9.9")), "any answering model is recorded");
+  } finally {
+    delete process.env.PI_WARDEN_TRACE_DIR;
+  }
+});
+
+test("PI_WARDEN_DB is confined to this test fixture", () => {
   const dbPath = process.env.PI_WARDEN_DB;
   assert.ok(dbPath, "PI_WARDEN_DB must be set before extension tests run");
-  const home = homedir();
-  assert.ok(!dbPath.startsWith(home), `PI_WARDEN_DB (${dbPath}) must not be under the real home directory (${home})`);
+  assert.equal(dbPath, join(temporary, "agent", "pi-warden", "holds.db"), "the database must stay in the isolated fixture, even when TMPDIR is under home");
 });
 
 test("should-proceed defaults to trace-only for interactive and headless agents", async () => {
@@ -343,10 +457,16 @@ test("action rules context is disclosed, rides the request only while a violatio
 
     const { disclosure } = await import("../src/extension.js");
     assert.match(disclosure, /unless the rules guard is on/i);
+    assert.match(disclosure, /when a guarded bash call runs a script from the project or a temp folder, up to five redacted lines of its body \(600 characters\) that match a floor pattern/i, "the script body lines ride the request");
     assert.match(disclosure, /one judged action call in twenty .*up to eight redacted earlier user\/assistant text messages and the resolved active rules file content/i, "earlier messages and the rules content ride the sample");
     assert.match(disclosure, /only while a rule violation is open/i);
     assert.match(disclosure, /short continuation or a relayed child report, which send nothing/i);
     assert.doesNotMatch(disclosure, /with every action request/i);
+    assert.match(disclosure, /Token Guardian.*allow-listed redacted metrics.*role.*lifecycle.*pause reason.*failure continuation plan.*observed USD cost.*observer USD cost.*soft and hard USD limits.*descendant count/i);
+    assert.match(disclosure, /root ID stays local and is never sent/i);
+    assert.match(disclosure, /answers are recorded in the trace only.*never answers Guardian, steers, wakes, or holds/i);
+    assert.match(disclosure, /progress material-progress count.*reads and writes since progress.*repeated-operation count.*equivalent-error count.*SHA-256 operation signature.*age since last progress.*MCP availability state.*capability count/i);
+    assert.match(disclosure, /Token Guardian.*excludes.*prompt text.*source code.*raw commands.*command results.*filesystem paths.*raw errors.*credentials/i);
   } finally { await rm(rulesFile); }
 });
 
@@ -980,6 +1100,58 @@ test("context.dedupeRuns false keeps repeated runs in messages and tool results,
   assert.equal(await toolResult("bash", { command: "cat relay.txt" }, incoming, false, ctx), undefined);
 });
 
+// A fetch of about 107,700 characters in 1,893 lines; Claude Code saves a result this size to a file instead of passing it to the model.
+const fetchedLines = Array.from({ length: 1893 }, (_, index) => `fetched line ${index}: ${"page text ".repeat(3)}${"z".repeat(index % 16)}`);
+const fetchedPage = fetchedLines.join("\n");
+const savedResult = "/home/user/.claude/projects/-home-user-project/5e1f0c2a-1b7d-4c55-9e0a-2f4b8d6c1a3e/tool-results/mcp-custom-tools-tiny_fetch-1.txt";
+const fetchContext = (provider: string, page: string) => context({ model: { provider, id: "m" }, sessionManager: { getBranch: () => [
+  { id: "a1", type: "message", message: { role: "assistant", provider, model: "m", content: [{ type: "toolCall", id: "call-0", name: "tiny_fetch", arguments: { urls: ["https://example.com/page"] } }] } },
+  { id: "r1", type: "message", message: { role: "toolResult", toolCallId: "call-0", toolName: "tiny_fetch", content: [{ type: "text", text: page }], isError: false } },
+] } });
+const cutPointers = (result: unknown) => [...((result as { content?: Array<{ text?: string }> } | undefined)?.content?.[0]?.text ?? "").matchAll(/\[pi-warden: the next \d+ lines repeat .+ full text: (.+)\]/g)];
+
+test("on claude-bridge, a result over Claude Code's output limit is not seen: a read of its saved file comes back whole", async () => {
+  await writeConfig(JSON.stringify({ typesafe: true, stuck: { enabled: false }, ...STACK_BAR }));
+  nextAnswers = { retention: "all" };
+  assert.equal(Math.round(fetchedPage.length / 100), 1077);
+  const ctx = fetchContext("claude-bridge", fetchedPage);
+  // Each read takes other lines, so none is an identical duplicate of the one before.
+  const reads: Array<[string, Record<string, unknown>, number]> = [
+    ["read", { path: savedResult, offset: 701, limit: 400 }, 700],
+    ["bash", { command: `sed -n '1101,1500p' ${savedResult}` }, 1100],
+    // A copy outside the tool-results directory: only the seen index can keep this one whole.
+    ["bash", { command: "sed -n '301,700p' /tmp/page-copy.txt" }, 300],
+  ];
+  for (const [tool, input, from] of reads) {
+    await toolCall(tool, input, ctx);
+    const pointers = cutPointers(await toolResult(tool, input, `${fetchedLines.slice(from, from + 400).join("\n")}\n\n[more lines in file]`, false, ctx));
+    for (const pointer of pointers) await rm(join(pointer[1]!, ".."), { recursive: true, force: true });
+    assert.equal(pointers.length, 0, `${tool} ${JSON.stringify(input)} is not cut`);
+  }
+});
+
+test("the repeated-run cut still works on another provider, and on claude-bridge under the output limit", async () => {
+  await writeConfig(JSON.stringify({ typesafe: true, stuck: { enabled: false }, ...STACK_BAR }));
+  nextAnswers = { retention: "all" };
+  const other = fetchContext("anthropic", fetchedPage);
+  for (const [tool, input, from] of [["read", { path: savedResult, offset: 701, limit: 400 }, 700], ["bash", { command: `sed -n '1101,1500p' ${savedResult}` }, 1100]] as const) {
+    await toolCall(tool, input, other);
+    const pointers = cutPointers(await toolResult(tool, input, `${fetchedLines.slice(from, from + 400).join("\n")}\n\n[more lines in file]`, false, other));
+    for (const pointer of pointers) await rm(join(pointer[1]!, ".."), { recursive: true, force: true });
+    assert.equal(pointers.length, 1, `${tool} on another provider is cut`);
+  }
+  // 250 lines, about 14,000 characters: under Claude Code's limit, so the model has it.
+  const small = fetchedLines.slice(0, 250);
+  const bridge = fetchContext("claude-bridge", small.join("\n"));
+  const input = { path: "notes/page.txt", offset: 51, limit: 150 };
+  await toolCall("read", input, bridge);
+  const result = await toolResult("read", input, `${small.slice(50, 200).join("\n")}\n\n[${"tail ".repeat(500)}]`, false, bridge);
+  const pointers = cutPointers(result);
+  for (const pointer of pointers) await rm(join(pointer[1]!, ".."), { recursive: true, force: true });
+  assert.equal(pointers.length, 1, "a result under the limit on claude-bridge is cut");
+  assert.match((result as { content: Array<{ text: string }> }).content[0]!.text, /the next 150 lines repeat an earlier tiny_fetch result/);
+});
+
 test("recall kinds: a scoped search keeps the saving, a whole-file read is counted as such", async () => {
   await writeConfig(JSON.stringify({  typesafe: true, stuck: { enabled: false }, context: { recallTool: "grep" } , ...STACK_BAR }));
   nextAnswers = { retention: "summary_only" };
@@ -1189,7 +1361,7 @@ test("a headless run tells the agent about warn-level calls; an interactive one 
   nextAnswers = { irreversible: 0.55, off_task: 0.1, scope: "expected_step" };
   await toolCall("bash", { command: "npm run db:reset" }, context({ hasUI: false }));
   const headlessSteer = sentMessages.find(sent => sent.message.customType === "pi-warden-steer");
-  assert.match(headlessSteer?.message.content ?? "", /ran with a warning \(possibly irreversible 0\.55\)/, "a warn nobody can see is delivered to the agent");
+  assert.match(headlessSteer?.message.content ?? "", /ran with a warning \(possibly irreversible\)/, "a warn nobody can see is delivered to the agent");
   assert.match(headlessSteer?.message.content ?? "", /it is on you/);
 
   sentMessages.length = 0;
@@ -1258,7 +1430,7 @@ test("trace-only off-task is silent headless and leaves the steer budget for a r
   nextAnswers = { irreversible: 0.55, off_task: 0.05, scope: "expected_step", mutates: 0.95 };
   assert.equal(await toolCall("bash", { command: "npm run db:reset" }, headless), undefined);
   assert.equal(sentMessages.length, 1, "trace-only calls did not spend the one-message budget");
-  assert.match(sentMessages[0]!.message.content, /ran with a warning \(possibly irreversible 0\.55\)/);
+  assert.match(sentMessages[0]!.message.content, /ran with a warning \(possibly irreversible\)/);
 
   await runCommand("status", headless);
   assert.match(sentMessages.at(-1)!.message.content, /Steers sent: 1 \(action 1\)\./, "trace-only findings are diagnostics, not skipped delivery attempts");
@@ -1278,7 +1450,7 @@ test("trace-only off-task removes only its structured reason from mixed headless
   assert.equal(await toolCall("bash", { command: "npm run audit" }, headless), undefined);
   const beforeDelivery = sentMessages.map(({ message }) => message.content).join("\n");
   assert.match(beforeDelivery, /review the off-task audit before release/, "a user rule that mentions off-task is preserved");
-  assert.match(beforeDelivery, /possibly irreversible 0\.55/, "an independent reason before off-task is preserved");
+  assert.match(beforeDelivery, /possibly irreversible/, "an independent reason before off-task is preserved");
   assert.doesNotMatch(beforeDelivery, /off-task 0\.95 \(unrelated to the request/, "only the generated trace-only reason is removed");
 
   await runCommand("trace", headless);
@@ -1292,7 +1464,7 @@ test("trace-only off-task removes only its structured reason from mixed headless
   assert.equal(await toolCall("write", { path: join(temporary, "mixed-security.ts"), content: "export const safe = true;" }, headless), undefined);
   const delivered = sentMessages.map(({ message }) => message.content).join("\n");
   assert.match(delivered, /proposed write may introduce a security weakness/, "the dedicated security warning remains");
-  assert.match(delivered, /possible security weakness 0\.92 in written content/, "an independent reason after off-task is preserved");
+  assert.match(delivered, /possible security weakness in written content/, "an independent reason after off-task is preserved");
   assert.doesNotMatch(delivered, /off-task 0\.95 \(unrelated to the request/, "no mixed delivery carries the trace-only reason");
 });
 
@@ -1318,7 +1490,7 @@ test("trace-only off-task does not soften an independent confirm decision", asyn
   assert.equal(confirms.length, 1, "the normal confirmation dialog ran");
   assert.match(confirms[0]!.message, /irreversible 0\.95/);
   assert.match(confirms[0]!.message, /off-task 0\.95/, "the user-facing diagnostic view remains complete");
-  assert.match(blocked?.reason ?? "", /irreversible 0\.95/, "the agent receives the independent hold reason");
+  assert.match(blocked?.reason ?? "", /irreversible/, "the agent receives the independent hold reason");
   assert.doesNotMatch(blocked?.reason ?? "", /off-task 0\.95/, "the agent does not receive the trace-only reason");
 });
 
@@ -1692,6 +1864,35 @@ test("the Action guard is wired to the session: the prompt is the task, siblings
   assert.equal(networkCalls, 2, "and its judgment is reused for its own hook");
 });
 
+test("herdr reports blocking while a warden confirm dialog waits, clears it after, and headless never emits", async () => {
+  await writeConfig(JSON.stringify({  mode: "confirm", notices: true , ...STACK_BAR }));
+  prompt = "push to origin";
+  const allowed = await toolCall("bash", { command: "git push --force origin main" });
+  assert.equal(allowed, undefined, "approved at the dialog");
+  const open = busEvents.filter(entry => entry.channel === "herdr:blocked");
+  assert.deepEqual(open, [
+    { channel: "herdr:blocked", data: { active: true, label: "warden: allow this bash call?" } },
+    { channel: "herdr:blocked", data: { active: false } },
+  ], "one active pair around the dialog: herdr marks the pane blocked then unblocked");
+
+  // A decline ends the dialog too, so the clear emission is the same: herdr cannot tell an answer from an abort.
+  confirmResult = false;
+  const declined = await toolCall("bash", { command: "git push --force origin main" });
+  assert.equal(declined?.block, true);
+  const pairs = busEvents.filter(entry => entry.channel === "herdr:blocked");
+  assert.equal(pairs.length, 4, "the next dialog adds exactly one more active/clear pair");
+  assert.deepEqual(pairs[2], { channel: "herdr:blocked", data: { active: true, label: "warden: allow this bash call?" } });
+  assert.deepEqual(pairs[3], { channel: "herdr:blocked", data: { active: false } });
+
+  // A headless confirm falls back to steer: no dialog opens, so no pane reports blocked, and the call is held.
+  busEvents.length = 0;
+  const confirmsBefore = confirms.length;
+  const headless = await toolCall("bash", { command: "git push --force origin main" }, context({ hasUI: false }));
+  assert.equal(headless?.block, true, "confirm without a UI falls back to steer and holds the call");
+  assert.equal(confirms.length, confirmsBefore, "headless runs open no confirm dialog");
+  assert.equal(busEvents.length, 0, "headless runs emit nothing: no pane can show them");
+});
+
 test("mode confirm shows a dialog; mode advise only reports; PI_WARDEN_MODE overrides the file", async () => {
   await writeConfig(JSON.stringify({  mode: "confirm", notices: true , ...STACK_BAR }));
   const allowed = await toolCall("bash", { command: "git push --force origin main" });
@@ -1728,7 +1929,7 @@ test("with consent, Jev judgments drive warn and hold, and a quiet verdict folds
   nextAnswers = { irreversible: 0.92, off_task: 0.3, scope: "plausible_side_step" };
   const held = await toolCall("bash", { command: "npm run db:reset" });
   assert.equal(held?.block, true);
-  assert.match(held?.reason ?? "", /irreversible 0\.92/);
+  assert.match(held?.reason ?? "", /irreversible/);
   assert.match(held?.reason ?? "", /retry the same call and pi-warden will let it through/);
   assert.equal(networkCalls, 2);
 });
@@ -2366,7 +2567,7 @@ test("done-check: an edit after a passing run makes the run unverified again", a
   assert.deepEqual(requests.at(-1)!.state.run, { file_changes: 2, checks_run: [] }, "the stale pass is not verification");
   assert.equal(sentMessages.length, 1, "the agent is nudged to run the checks again");
   assert.match(sentMessages[0]!.message.content, /after 2 file changes with no test, build, or lint run since the last change/);
-  assert.match(sentMessages[0]!.message.content, /Run the project's tests, build, or lint/);
+  assert.match(sentMessages[0]!.message.content, /Run npm test on what you changed\./, "the nudge names the check that passed earlier in this session");
   assert.deepEqual(sentMessages[0]!.options, { deliverAs: "followUp", triggerTurn: true });
   assert.match(widgets.at(-1)!.at(-1)!, /^UNVERIFIED\s+done\s+done-check · 2 changes · 0\/0 checks passed · claims done 0\.90 /);
 });
@@ -2387,9 +2588,9 @@ test("done-check: a UI change needs a visual check after it, even after passing 
   await newPrompt("and the footer");
   await toolResult("edit", { path: "web/app.css", edits: [] }, "ok", false);
   await toolResult("bash", { command: "npm test" }, "31 passing", false);
-  await toolResult("bash", { command: "agent-browser open http://localhost:3000 && agent-browser screenshot /tmp/footer.png" }, "saved", false);
+  await toolResult("bash", { command: "agent-browser open http://localhost:3000 && agent-browser snapshot -i" }, "Heading\nFooter", false);
   await agentEnd("Done: the footer is fixed.");
-  assert.equal(networkCalls, 1, "a screenshot after the last UI edit is the proof: no done-check");
+  assert.equal(networkCalls, 1, "a page snapshot after the last UI edit is the proof: no done-check");
 
   await newPrompt("and the sidebar");
   await toolResult("mcp__chrome_devtools", { tool: "take_screenshot" }, "image", false);
@@ -2408,6 +2609,27 @@ test("done-check: a UI change needs a visual check after it, even after passing 
   await agentEnd("The page is done.");
   assert.equal(networkCalls - before, 1, "a UI file written from bash is a UI change too");
   assert.ok("claims_done" in requests.at(-1)!.questions);
+});
+
+test("done-check: an image in a successful result counts as UI proof", async () => {
+  await grantConsent();
+  await newPrompt("make the header sticky");
+  await toolResult("edit", { path: "web/app.css", edits: [] }, "ok", false);
+  await toolResult("bash", { command: "npm test" }, "31 passing", false);
+  await fire("tool_result", { toolName: "take_screenshot", toolCallId: "shot", input: {}, isError: false, content: [{ type: "image", data: "synthetic", mimeType: "image/png" }] }, context());
+  await agentEnd("Done: the header is sticky.");
+  assert.equal(networkCalls, 0, "the image is the proof: no done-check request");
+  assert.equal(sentMessages.length, 0, "no UI nudge at the end of the turn");
+});
+
+test("a skipped check is one trace line with the reason and no command", async () => {
+  await grantConsent();
+  await newPrompt("fix the parser bug");
+  await toolResult("bash", { command: "npm test 2>&1 | tail -20" }, "no runner summary in here", false);
+  await runCommand("trace", context({ hasUI: false }));
+  const trace = sentMessages.at(-1)!.message.content;
+  assert.match(trace, /done: warden · done · check not counted\n  exit code hidden by \| tail; no runner summary(?:\nTrace file: .*)?$/);
+  assert.ok(!trace.includes("npm test"), "no trace line or detail names the command");
 });
 
 test("done-check: non-UI changes, and uiProof off, behave as before", async () => {
@@ -2544,7 +2766,12 @@ test("/warden init --force overwrites an existing pi-warden.md in headless mode"
   const targetPath = join(temporary, "pi-warden.md");
   await writeFile(targetPath, "# Old rules\nKeep these.\n");
   sentMessages.length = 0; sentUserMessages.length = 0;
-  await runCommand("init --force", context({ hasUI: false }));
+  // The command waits for the injected run's lifecycle (the session tests cover the real flow); drive it here.
+  const initCommand = runCommand("init --force", context({ hasUI: false }));
+  while (sentUserMessages.length === 0) await new Promise(resolve => setImmediate(resolve));
+  await fire("before_agent_start", { prompt: sentUserMessages.at(-1) }, context({ hasUI: false }));
+  await fire("agent_end", { messages: [] }, context({ hasUI: false }));
+  await initCommand;
   const msg = sentMessages.find(m => /did not create/.test(m.message.content) || /created/.test(m.message.content));
   assert.ok(msg, "reports the outcome via pi.sendMessage");
   const sentPrompt = sentUserMessages.at(-1);
@@ -2567,6 +2794,78 @@ test("/warden init without --force refuses to overwrite in headless mode", async
   assert.match(content, /Existing rules/, "file unchanged");
   const msg = sentMessages.find(m => /Pass --force to overwrite/.test(m.message.content));
   assert.ok(msg, "refuses with --force hint");
+});
+
+test("warden's own extension-sourced prompt passes the input handler while a busy flag is set", async () => {
+  // Regression: /warden init set initRunning and THEN sendUserMessage'd its prompt. The input
+  // handler saw the flag and swallowed the prompt as "handled", so no agent turn ever started and
+  // init always reported "Agent did not create pi-warden.md". The input event the command's own
+  // sendUserMessage emits carries source "extension"; operator input does not.
+  // The busy-guards apply only to operator input; warden-injected input passes, so the command's
+  // own prompt reaches the agent while its flag is up.
+  const inputHandlers = extension.handlers.get("input") ?? [];
+  assert.equal(inputHandlers.length, 1);
+  const handler = inputHandlers[0] as (event: Record<string, unknown>, ctx: unknown) => Promise<{ action?: string } | undefined>;
+  // Idle: extension prompts pass through.
+  let result = await Reflect.apply(handler, undefined, [
+    { type: "input", text: "anything", source: "extension" },
+    context(),
+  ]);
+  assert.ok(!result || result.action === "continue", "extension input passes through when idle");
+  // Start init and hold the command until its prompt was sent, then run the handler the way the
+  // host does: the injected prompt's input event fires during sendUserMessage.
+  sentUserMessages.length = 0;
+  const targetPath = join(temporary, "pi-warden.md");
+  await rm(targetPath, { force: true });
+  const initPromise = runCommand("init", context({ hasUI: false }));
+  while (sentUserMessages.length === 0) await new Promise(resolve => setImmediate(resolve));
+  result = await Reflect.apply(handler, undefined, [
+    { type: "input", text: sentUserMessages.at(-1), source: "extension" },
+    context(),
+  ]);
+  assert.ok(!result || result.action === "continue", "init's own prompt is not swallowed while its flag is set");
+  // The abandoned command is waiting on the completion gate, not the semaphore: settle it.
+  await fire("before_agent_start", { prompt: sentUserMessages.at(-1) }, context({ hasUI: false }));
+  await fire("agent_end", { messages: [] }, context({ hasUI: false }));
+  await initPromise;
+  // While init is in flight, operator input still waits.
+  await rm(targetPath, { force: true });
+  const initPromise2 = runCommand("init --force", context({ hasUI: false }));
+  while (sentUserMessages.length === 1) await new Promise(resolve => setImmediate(resolve));
+  result = await Reflect.apply(handler, undefined, [
+    { type: "input", text: "hello operator", source: "interactive" },
+    context(),
+  ]);
+  assert.ok(result && result.action === "handled", "operator input is swallowed while init is running");
+  await fire("before_agent_start", { prompt: sentUserMessages.at(-1) }, context({ hasUI: false }));
+  await fire("agent_end", { messages: [] }, context({ hasUI: false }));
+  await initPromise2;
+});
+
+test("/warden init waits for the agent run it injected, not for the idle agent", async () => {
+  // Pi's extension-facing sendUserMessage is fire-and-forget, so a plain `await ctx.waitForIdle()` after it can return
+  // before the injected run even flips the session busy — the command would report while the agent is still working, or
+  // report the file as missing when it just needed a moment. The command waits on the run's own lifecycle instead.
+  const targetPath = join(temporary, "pi-warden.md");
+  await rm(targetPath, { force: true });
+  sentMessages.length = 0; sentUserMessages.length = 0;
+  const initCommand = runCommand("init", context({ hasUI: false }));
+  while (sentUserMessages.length === 0) await new Promise(resolve => setImmediate(resolve));
+  // The wait passes without any waitForIdle involvement: while the run is un-started, the command must not proceed.
+  let settled = false;
+  void initCommand.then(() => { settled = true; });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(sentUserMessages.length, 1);
+  assert.equal(settled, false, "the command does not report before the injected run started");
+  await fire("before_agent_start", { prompt: sentUserMessages.at(-1) }, context({ hasUI: false }));
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(settled, false, "the command does not report before the injected run ended");
+  // Once the run has both started and ended, the command proceeds and reads the file from disk.
+  await fire("agent_end", { messages: [] }, context({ hasUI: false }));
+  await initCommand;
+  const msg = sentMessages.find(m => /did not create|created/.test(m.message.content));
+  assert.ok(msg, "the command reports the disk state after the run");
+  assert.match(msg.message.content, /did not create/, "the sendUserMessage stub is a no-op, so the honest report is that the file is absent");
 });
 
 test("/warden enable with an existing key does not prompt for one", async () => {
@@ -4211,6 +4510,51 @@ test("index write bypass: flag clears after error in index command", async () =>
   assert.ok(result !== undefined || notices.length === 0, "should be judged after flag clears");
 });
 
+test("/warden index finalizes an entries-only file: the fallback runs when the strict read finds no metadata", async () => {
+  // The index prompt asks the model for `{ entries: [...] }` and leaves the metadata to warden. The strict read rejects
+  // that shape, so the entries-only fallback must not depend on it, or the file stays without metadata and every
+  // session loads the index as missing.
+  const globalPath = indexPath("global");
+  await mkdir(join(globalPath, ".."), { recursive: true });
+  await rm(globalPath, { force: true });
+  const skills = [conscienceSkill("impeccable", "Frontend interface design, polish, and UX")];
+  const ctx = context({ getSystemPromptOptions: () => ({ cwd: temporary, skills }) });
+  sentUserMessages.length = 0;
+  const indexCommand = runCommand("index", ctx);
+  while (sentUserMessages.length === 0) await new Promise(resolve => setImmediate(resolve));
+  await writeFile(globalPath, JSON.stringify({
+    entries: [{ kind: "skill", name: "impeccable", scope: "global", sourceHash: "model", role: "conversation", lead: "Frontend polish for interfaces", useWhen: ["the UI looks off and needs polish", "a layout needs a design pass"], notWhen: [], inputs: "", examples: ["make this page look better", "polish the settings screen"], thin: false }],
+  }));
+  await fire("before_agent_start", { prompt: sentUserMessages.at(-1) }, ctx);
+  await fire("agent_end", { messages: [] }, ctx);
+  await indexCommand;
+  const written = readIndex(globalPath);
+  assert.ok(written, "the entries-only file is rewritten with metadata");
+  assert.equal(written!.formatVersion, 1);
+  assert.notEqual(written!.builtAt, "", "warden stamps the build time");
+  assert.deepEqual(written!.entries.map(entry => entry.name), ["impeccable"]);
+  assert.ok(!notices.some(notice => /Index rejected/.test(notice.text)), "nothing is rejected");
+  await rm(globalPath, { force: true });
+});
+
+test("/warden index reports rejected entries of an entries-only file instead of keeping it silently", async () => {
+  const globalPath = indexPath("global");
+  await mkdir(join(globalPath, ".."), { recursive: true });
+  await rm(globalPath, { force: true });
+  const skills = [conscienceSkill("impeccable", "Frontend interface design, polish, and UX")];
+  const ctx = context({ getSystemPromptOptions: () => ({ cwd: temporary, skills }) });
+  sentUserMessages.length = 0;
+  const indexCommand = runCommand("index", ctx);
+  while (sentUserMessages.length === 0) await new Promise(resolve => setImmediate(resolve));
+  await writeFile(globalPath, JSON.stringify({ entries: [{ kind: "skill" }] }));
+  await fire("before_agent_start", { prompt: sentUserMessages.at(-1) }, ctx);
+  await fire("agent_end", { messages: [] }, ctx);
+  await indexCommand;
+  assert.ok(notices.some(notice => /Index rejected:[\s\S]*global index: entry/.test(notice.text)), "the rejection is reported");
+  assert.equal(readIndex(globalPath), undefined, "the rejected file is not finalized");
+  await rm(globalPath, { force: true });
+});
+
 test("/warden trace sends the trace as text when the host never builds the sidebar, and names the trace file", async () => {
   await grantConsent();
   const traceDir = join(temporary, "host-traces");
@@ -4484,6 +4828,21 @@ test("the commandcode backend sends judgments to its own host, path, and model",
   }
 });
 
+test("the subq backend sends judgments to api.subq.ai with its default model and SUBQ_API_KEY", async () => {
+  await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: "subq", rules: { enabled: false }, ...STACK_BAR }));
+  const saved = process.env.SUBQ_API_KEY;
+  process.env.SUBQ_API_KEY = "subq-fake-test-key-000";
+  try {
+    await toolCall("bash", { command: "npm test" });
+    assert.equal(networkCalls, 1);
+    assert.equal(requestUrls[0], "https://api.subq.ai/v1/systemone");
+    assert.equal(requests[0]!.model, "subq-snap-preview");
+    assert.equal(requestAuth[0], "Bearer subq-fake-test-key-000", "the key comes from SUBQ_API_KEY");
+  } finally {
+    if (saved === undefined) delete process.env.SUBQ_API_KEY; else process.env.SUBQ_API_KEY = saved;
+  }
+});
+
 test("a caller-supplied endpoint object reaches createTypeSafe unchanged and answers from its own host, model, and key", async () => {
   await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: gateway, rules: { enabled: false }, ...STACK_BAR }));
   process.env.ACME_JUDGE_KEY = "acme-fake-test-key-000";
@@ -4503,7 +4862,7 @@ test("judgments off: an unknown typesafeBackend name is refused with the message
   await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: "azure", rules: { enabled: false }, ...STACK_BAR }));
   await toolCall("bash", { command: "npm test" });
   await toolCall("bash", { command: "npm run lint" });
-  assert.deepEqual(judgmentsOff(), ["warden: Jev judgments are off (typesafeBackend refused: Unknown judgment backend \"azure\". Valid backends: typesafe, openrouter, commandcode, liquid.)"], "said once, carrying pi-typesafe's refusal message");
+  assert.deepEqual(judgmentsOff(), ["warden: Jev judgments are off (typesafeBackend refused: Unknown judgment backend \"azure\". Valid backends: typesafe, openrouter, commandcode, liquid, subq.)"], "said once, carrying pi-typesafe's refusal message");
   assert.equal(networkCalls, 0, "no client is created and nothing is sent");
   assert.equal(requests.length, 0);
   await runCommand("status");
@@ -5096,6 +5455,42 @@ test("rules at turn start: the prompt does not wait for the judgment, and the re
   }
 });
 
+test("rules at turn start on subq: 20 rules take two requests of at most 16 questions and name the same rule as one request elsewhere", async () => {
+  const rules = join(temporary, "pi-warden.md");
+  await writeFile(rules, Array.from({ length: 20 }, (_, index) => `# Rule ${index + 1}\nCode must follow convention number ${index + 1}.`).join("\n\n") + "\n");
+  const saved = process.env.SUBQ_API_KEY;
+  process.env.SUBQ_API_KEY = "subq-fake-test-key-000";
+  const run = async (backend: string) => {
+    await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: backend, notices: true, rules: { enabled: true }, slop: { enabled: false }, done: { enabled: false }, cause: { enabled: false }, ...STACK_BAR }));
+    // A new session builds the judge again from the config just written.
+    await sessionStart();
+    requests.length = 0;
+    requestUrls.length = 0;
+    const sentBefore = sentMessages.length;
+    const before = answeredRequests;
+    await fire("before_agent_start", { prompt: "Read the config module and tighten the retry default" });
+    await waitFor(() => answeredRequests >= before + (backend === "subq" ? 2 : 1), "the background rules judgment");
+    await tick();
+    await toolCall("read", { path: "src/config.ts" });
+    await toolTurn();
+    const counts = requests.filter(request => "applies_0" in request.questions || "applies_19" in request.questions).map(request => Object.keys(request.questions).length);
+    return { counts, urls: [...new Set(requestUrls)], delivered: sentMessages.slice(sentBefore).filter(entry => entry.message.customType === "pi-warden-rules").map(entry => entry.message.content) };
+  };
+  try {
+    nextAnswers = { ...nextAnswers, applies_0: 0.1, applies_17: 0.9 };
+    const wide = await run("typesafe");
+    const narrow = await run("subq");
+    assert.deepEqual(wide.counts, [20], "one request on typesafe, as before");
+    assert.deepEqual(narrow.counts, [16, 4], "no request over subq's 16 questions");
+    assert.ok(narrow.urls.every(url => url === "https://api.subq.ai/v1/systemone"), narrow.urls.join(", "));
+    assert.deepEqual(narrow.delivered, ["Rules that apply to this request:\n- Rule 18: Code must follow convention number 18."], "the rule in the second request is named");
+    assert.deepEqual(narrow.delivered, wide.delivered);
+  } finally {
+    if (saved === undefined) delete process.env.SUBQ_API_KEY; else process.env.SUBQ_API_KEY = saved;
+    await rm(rules, { force: true });
+  }
+});
+
 test("rules at turn start: no rule over the threshold queues nothing", async () => {
   await curatorConfig();
   const rules = join(temporary, "pi-warden.md");
@@ -5187,6 +5582,28 @@ test("rules at turn start: a short continuation and a relayed child report send 
     assert.match(traceText, /rules · turn start · skipped/);
     assert.match(traceText, /skipReason: short_continuation/);
     assert.match(traceText, /skipReason: relayed_report/);
+  } finally {
+    await rm(rules, { force: true });
+  }
+});
+
+test("rules at turn start: a run a custom message starts has no prompt, and the reminder skips instead of crashing", async () => {
+  await curatorConfig();
+  await writeConfig(JSON.stringify({ typesafe: true, notices: true, rules: { enabled: true }, conscience: { enabled: true }, ...STACK_BAR }));
+  const rules = join(temporary, "pi-warden.md");
+  await writeFile(rules, "# No hardcoded secrets\nSource code must not contain passwords or API keys.\n");
+  try {
+    const requestsBefore = requests.length;
+    // A newer Pi fires before_agent_start without a prompt field when a custom message triggers the run.
+    await fire("before_agent_start", {});
+    await fire("agent_start", {});
+    await tick();
+    assert.equal(requests.length, requestsBefore, "no operator prompt, so no judgment is sent");
+    await runCommand("trace", context({ hasUI: false }));
+    const traceText = sentMessages.at(-1)!.message.content;
+    assert.match(traceText, /rules · turn start · skipped/);
+    assert.match(traceText, /skipReason: custom_trigger/);
+    assert.match(traceText, /conscience · turn start · skipped/);
   } finally {
     await rm(rules, { force: true });
   }
@@ -5348,7 +5765,12 @@ test("/warden rules tune: a rule flagged by rules check sends one rewrite prompt
   nextAnswers = { "judgeable_no-duplicate-logic": "too_vague" };
   await runCommand("rules check", ctx);
   sentUserMessages.length = 0;
-  await runCommand("rules tune", ctx);
+  // The tune command waits for the run its prompt injects; drive the gate the way the host does.
+  const tuneCommand = runCommand("rules tune", ctx);
+  while (sentUserMessages.length === 0) await new Promise(resolve => setImmediate(resolve));
+  await fire("before_agent_start", { prompt: sentUserMessages.at(-1) }, ctx);
+  await fire("agent_end", { messages: [] }, ctx);
+  await tuneCommand;
   assert.equal(sentUserMessages.length, 1, "one prompt for the session's agent");
   const prompt = sentUserMessages[0]!;
   assert.match(prompt, /Rewrite the flagged project rules in `pi-warden\.md` with your file tools/);
@@ -5695,4 +6117,87 @@ test("asked: no assistant message before the latest user message, or a message w
   assert.equal(askedOf(assistantEntry({ type: "text", text: "Earlier." }), userEntry("a"), assistantEntry({ type: "toolCall", id: "c1", name: "bash", arguments: {} }), userEntry("b")), undefined);
   assert.equal(askedOf(assistantEntry({ type: "text", text: "Earlier." }), userEntry("a"), userEntry("b")), undefined, "the message before the earlier prompt is not what this reply answers");
   assert.equal(askedOf(assistantEntry({ type: "text", text: "Delete it?" }), userEntry("yes"), assistantEntry({ type: "toolCall", id: "c2", name: "bash", arguments: {} }), { type: "message", message: { role: "toolResult", toolCallId: "c2", toolName: "bash", content: [] } }), "Delete it?", "calls made after the reply do not hide it");
+});
+
+// ---------------------------------------------------------------------------
+// Cause-check: a final reply that names an unchecked cause is sent back.
+
+test("cause-check: a causal guess with no check in the run is sent back", async () => {
+  await grantConsentCause();
+  await newPrompt("why did the alert fire");
+  await toolResult("bash", { command: "git status" }, "clean", false);
+  nextAnswers = { states_cause: 0.9, hands_off: 0.05, checked: 0.05 };
+  const before = networkCalls;
+  await agentEnd("The alert is probably from a manual edit.");
+  assert.equal(networkCalls - before, 1);
+  const request = requests.at(-1)!;
+  assert.ok("states_cause" in request.questions, "the cause question reached Jev");
+  assert.equal(sentMessages.length, 1);
+  assert.match(sentMessages[0]!.message.content, /check it with your own tools/i);
+  assert.deepEqual(sentMessages[0]!.options, { deliverAs: "followUp", triggerTurn: true });
+});
+
+test("cause-check: a check handed to a person is sent back", async () => {
+  await grantConsentCause();
+  await newPrompt("why did the alert fire");
+  nextAnswers = { states_cause: 0.1, hands_off: 0.9, checked: 0.05 };
+  await agentEnd("Ask the team whether the config changed.");
+  assert.equal(sentMessages.length, 1);
+  assert.match(sentMessages[0]!.message.content, /asks a person to check something/i);
+  assert.match(sentMessages[0]!.message.content, /check it with your own tools/i);
+});
+
+test("cause-check: a run that checked the claim is recorded but not steered", async () => {
+  await grantConsentCause();
+  await newPrompt("why did the alert fire");
+  await toolResult("bash", { command: "gh run view 7 --log" }, "the deploy at 09:00 printed the alert", false);
+  nextAnswers = { states_cause: 0.9, hands_off: 0.05, checked: 0.9 };
+  await agentEnd("The alert is probably from the deploy at 09:00.");
+  assert.equal(networkCalls, 1, "the reply was judged");
+  assert.equal(sentMessages.length, 0, "no steer when the run checked the cause");
+  await runCommand("trace", context({ hasUI: false }));
+  assert.match(sentMessages.at(-1)!.message.content, /cause: warden · cause-check/);
+});
+
+test("cause-check: a reply with no causal or hand-off wording sends no request", async () => {
+  await grantConsentCause();
+  await newPrompt("fix the parser");
+  nextAnswers = { states_cause: 0.9, checked: 0.05 };
+  await agentEnd("Tests pass; the parser bug is fixed.");
+  assert.equal(networkCalls, 0);
+  assert.equal(sentMessages.length, 0);
+});
+
+test("cause-check: when the done-check steers the same reply, the cause-check records its decision only", async () => {
+  await grantConsentCause();
+  await newPrompt("fix the parser and explain the alert");
+  await toolResult("edit", { path: "src/parser.ts", edits: [] }, "ok", false);
+  nextAnswers = { claims_done: 0.95, claims_verified: 0.1, verification_applies: 0.9, outcome: "complete", states_cause: 0.9, hands_off: 0.05, checked: 0.05 };
+  await agentEnd("Fixed the parser; the alert is probably from a manual edit.");
+  assert.equal(sentMessages.length, 1, "one steer for the reply");
+  assert.match(sentMessages[0]!.message.content, /no test, build, or lint run/);
+  assert.ok(requests.some(item => "states_cause" in item.questions), "the cause-check still judged the reply");
+  assert.ok(!sentMessages.some(entry => /check it with your own tools/i.test(entry.message.content)), "the cause steer is not delivered");
+  await runCommand("trace", context({ hasUI: false }));
+  assert.match(sentMessages.at(-1)!.message.content, /cause: warden · cause-check/);
+});
+
+test("cause-check: the guard off sends nothing", async () => {
+  await writeConfig(JSON.stringify({ typesafe: true, notices: true, rules: { enabled: false }, cause: { enabled: false }, ...STACK_BAR }));
+  await newPrompt("why did the alert fire");
+  nextAnswers = { states_cause: 0.9, checked: 0.05 };
+  await agentEnd("The alert is probably from a manual edit.");
+  assert.equal(networkCalls, 0);
+  assert.equal(sentMessages.length, 0);
+});
+
+test("cause-check: a repeated unchecked cause is steered harder with the earlier date", async () => {
+  await grantConsentCause();
+  await newPrompt("why did the alert fire");
+  const at = Date.now() - 86_400_000;
+  await recordCause("a manual edit", temporary, at);
+  nextAnswers = { states_cause: 0.9, hands_off: 0.05, checked: 0.05, same_cause: "c1" };
+  await agentEnd("The alert is probably still from a manual edit.");
+  assert.equal(sentMessages.length, 1);
+  assert.match(sentMessages[0]!.message.content, new RegExp(new Date(at).toISOString().slice(0, 10)));
 });

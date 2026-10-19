@@ -6,7 +6,7 @@ import { BACKEND_NAMES, resolveJudgmentBackend } from "./backend.js";
 import { defaultHostDirs } from "./host-dirs.js";
 import type { HostDirs } from "./host-dirs.js";
 import { COMMAND_TOOLS } from "./tools.js";
-import { defaultWidgetConfig } from "./widget.js";
+import { WIDGET_BAR_MODES, WIDGET_PLACEMENTS, defaultWidgetConfig } from "./widget.js";
 import type { WidgetConfig } from "./widget.js";
 
 export interface Threshold {
@@ -168,6 +168,16 @@ export interface DoneGuardConfig {
   visualTools: VisualToolsConfig;
 }
 
+export interface CauseGuardConfig {
+  enabled: boolean;
+  /** P(the final reply states a cause or hands a check to a person) at or above this is judged. */
+  claimsCause: number;
+  /** Also send the agent a follow-up asking it to check the cause. Triggers one more LLM turn. */
+  nudge: boolean;
+  /** Days an unchecked cause is remembered for the repeat steer. */
+  windowDays: number;
+}
+
 /** Tool calls that show the rendered UI. Matching is case-insensitive. */
 export interface VisualToolsConfig {
   /** Heads of a shell command segment: `agent-browser`, `npx playwright`. */
@@ -188,9 +198,12 @@ export const DEFAULT_UI_FILES = [
 
 export function defaultVisualTools(): VisualToolsConfig {
   return {
-    commands: ["agent-browser", "playwright", "npx playwright", "flutter test", "fvm flutter test", "idb", "xcrun simctl io", "chrome", "chromium", "google-chrome"],
-    commandWords: ["screenshot"],
-    tools: ["screenshot", "take_snapshot", "navigate"],
+    // A head names the command that shows the page: a page text snapshot, or a browser or device test run. A screenshot
+    // subcommand only writes a file (`agent-browser screenshot PATH`, `idb screenshot`, `chrome --headless --screenshot`),
+    // so it is not a head; the saved image counts once something reads it.
+    commands: ["agent-browser snapshot", "agent-browser get text", "playwright test", "npx playwright test", "flutter test", "fvm flutter test"],
+    commandWords: [],
+    tools: ["take_snapshot"],
     images: ["png", "jpg", "jpeg", "webp"],
   };
 }
@@ -220,6 +233,8 @@ export interface SecurityConfig {
   threshold: number;
   /** Replace high-confidence credential values in tool results with `[redacted]` before the model sees them. */
   maskOutput: boolean;
+  /** Query parameters whose value is a share link rather than a credential. Empty by default; user config only. */
+  shareLinkParams: string[];
 }
 
 export interface RulesConfig {
@@ -340,6 +355,8 @@ export interface NotifyConfig {
 }
 
 export interface SubagentConfig {
+  /** Record Jev's answers to redacted Token Guardian evaluation events; never claims or acts. Independent of report triage. */
+  observer: boolean;
   /** Read async subagent reports at all. Off: warden ignores them, as before 0.14. */
   enabled: boolean;
   /** Ask Jev whether a report that names trouble deserves a wake. Off keeps the offline layer, which never wakes. */
@@ -350,14 +367,19 @@ export interface SubagentConfig {
   cooldownMs: number;
 }
 
-export type RecallTool = "auto" | "rg" | "ag" | "ugrep" | "git-grep" | "grep" | "select-string" | "findstr" | "none";
-const RECALL_TOOLS: readonly RecallTool[] = ["auto", "rg", "ag", "ugrep", "git-grep", "grep", "select-string", "findstr", "none"];
+export const RECALL_TOOLS = ["auto", "rg", "ag", "ugrep", "git-grep", "grep", "select-string", "findstr", "none"] as const;
+export type RecallTool = typeof RECALL_TOOLS[number];
 
-export function isRecallTool(value: unknown): value is RecallTool {
-  return typeof value === "string" && (RECALL_TOOLS as readonly string[]).includes(value);
+function isOption<T extends string>(value: unknown, options: readonly T[]): value is T {
+  return typeof value === "string" && (options as readonly string[]).includes(value);
 }
 
-export type WardenMode = "steer" | "confirm" | "advise";
+export function isRecallTool(value: unknown): value is RecallTool {
+  return isOption(value, RECALL_TOOLS);
+}
+
+export const WARDEN_MODES = ["steer", "confirm", "advise"] as const;
+export type WardenMode = typeof WARDEN_MODES[number];
 
 export interface WasteConfig {
   /** Master switch for the call-waste notes and the session tip. */
@@ -381,6 +403,16 @@ export interface PrefsConfig {
   enabled: boolean;
   /** At session start, send the standing preferences that pass every injection rule to the agent as one context message. */
   inject: boolean;
+}
+
+/** The silent-half field trial (trial.ts): a random half of sessions records what it would have told the agent. */
+export interface TrialConfig {
+  /**
+   * Put each session in arm live or silent, 50/50 from its id. A silent session judges as usual but records every
+   * suppressed delivery instead of sending it; holds, secret masking, security notices, and runaway stops stay live.
+   * Off by default, user file only: turning it on weakens guarding in half the sessions, so a project file must not.
+   */
+  silentHalf: boolean;
 }
 
 /** Per-model steer adaptation: a steer kind a model rarely follows or often disputes becomes trace-only for it. */
@@ -408,7 +440,8 @@ export interface LearningConfig {
   allowedRetentionDays: number;
 }
 
-export type ConscienceSkillMode = "off" | "recommend" | "load";
+export const CONSCIENCE_SKILL_MODES = ["off", "recommend", "load"] as const;
+export type ConscienceSkillMode = typeof CONSCIENCE_SKILL_MODES[number];
 
 export interface ConscienceSkillConfig {
   /** off: no automatic skill selection; recommend: name a skill and ask the agent to load it; load: supply instructions directly. */
@@ -476,6 +509,7 @@ export interface WardenConfig {
   action: ActionGuardConfig;
   stuck: StuckGuardConfig;
   done: DoneGuardConfig;
+  cause: CauseGuardConfig;
   slop: SlopGuardConfig;
   security: SecurityConfig;
   rules: RulesConfig;
@@ -505,6 +539,8 @@ export interface WardenConfig {
   conscience: ConscienceConfig;
   /** Standing preferences: corrections the user repeated in earlier sessions of this project. */
   prefs: PrefsConfig;
+  /** Silent-half field trial: off by default, user file only. */
+  trial: TrialConfig;
   /** Call-waste notes: advisory sentences attached to the tool result that triggers them. */
   waste: WasteConfig;
   /** Relevance compaction in place of Pi's compaction summary. Off by default. */
@@ -515,7 +551,7 @@ export interface WardenConfig {
 
 export const PACKAGE_NAME = "pi-warden";
 /** Bumped when WardenConfig gains a section; extension.ts checks it so a half-updated module graph is reported, not crashed on. */
-export const CONFIG_SCHEMA = 12;
+export const CONFIG_SCHEMA = 14;
 export const PROJECT_CONFIG_FILE = `${PACKAGE_NAME}.json`;
 
 export function defaultConfig(): WardenConfig {
@@ -552,8 +588,9 @@ export function defaultConfig(): WardenConfig {
     },
     stuck: { enabled: true, window: 12, minFailures: 3, cooldown: 3, sameStrategy: 0.7, churnThreshold: 5, nudge: true, repeatSteer: true, evidence: true, diffLimit: 3000, tailLimit: 1000 },
     done: { enabled: true, claimsDone: 0.7, nudge: true, uiProof: true, uiFiles: [...DEFAULT_UI_FILES], visualTools: defaultVisualTools() },
+    cause: { enabled: true, claimsCause: 0.7, nudge: true, windowDays: 7 },
     slop: { enabled: true, threshold: 0.7, prose: { enabled: true, audience: "technical", threshold: 0.7, trend: 2, minChars: 200 } },
-    security: { enabled: true, threshold: 0.7, maskOutput: true },
+    security: { enabled: true, threshold: 0.7, maskOutput: true, shareLinkParams: [] },
     rules: { enabled: true, threshold: 0.7, softThreshold: 0, files: [], fallback: true, maxChars: 8000, exclude: [], skip: [], sensitivePaths: {} },
     // 0.3 is the measured cut: 69% of the rules named apply, and 68 of the 73 requests that touch a rule's area get one.
     rulesAtTurnStart: { enabled: true, threshold: 0.3 },
@@ -561,7 +598,7 @@ export function defaultConfig(): WardenConfig {
     runaway: { enabled: true, repeats: 4, thinkingRepeats: 10, minChars: 400, recover: true },
     notify: { enabled: false, cooldownMs: 10000, command: [] },
     judge: { cooldownMs: 60000, failuresBeforeCooldown: 3 },
-    subagent: { enabled: true, wake: true, threshold: 0.8, cooldownMs: 120000 },
+    subagent: { enabled: true, wake: true, observer: true, threshold: 0.8, cooldownMs: 120000 },
     widget: defaultWidgetConfig(),
     steerVisible: false,
     notices: false,
@@ -585,6 +622,7 @@ export function defaultConfig(): WardenConfig {
       localFloor: 0.5,
     },
     prefs: { enabled: true, inject: true },
+    trial: { silentHalf: false },
     waste: { enabled: true, tip: false, every: 20, sleep: true, paging: true, search: true, recheck: true },
     // pi-claude-bridge compacts its own models and cancels on failure; its summary must not be replaced.
     compaction: { enabled: false, keepThreshold: 0.5, maxSummaryTokens: 20000, timeoutMs: 20000, maxRequests: 12, skipProviders: ["claude-bridge"] },
@@ -644,7 +682,7 @@ function positiveInteger(value: unknown, fallback: number): number {
 }
 
 export function isMode(value: unknown): value is WardenMode {
-  return value === "steer" || value === "confirm" || value === "advise";
+  return isOption(value, WARDEN_MODES);
 }
 
 /** One config warning for a rule value no kind accepts; the rule still applies, at the level named. */
@@ -931,7 +969,7 @@ function applyJudge(base: JudgeConfig, raw: unknown): JudgeConfig {
 function applySubagent(base: SubagentConfig, raw: unknown): SubagentConfig {
   if (!isObject(raw)) return base;
   const cooldown = typeof raw.cooldownMs === "number" && Number.isSafeInteger(raw.cooldownMs) && raw.cooldownMs >= 0 ? raw.cooldownMs : base.cooldownMs;
-  return { enabled: boolean(raw.enabled, base.enabled), wake: boolean(raw.wake, base.wake), threshold: probability(raw.threshold, base.threshold), cooldownMs: cooldown };
+  return { enabled: boolean(raw.enabled, base.enabled), wake: boolean(raw.wake, base.wake), observer: boolean(raw.observer, base.observer), threshold: probability(raw.threshold, base.threshold), cooldownMs: cooldown };
 }
 
 function applyDone(base: DoneGuardConfig, raw: unknown): DoneGuardConfig {
@@ -949,6 +987,16 @@ function applyDone(base: DoneGuardConfig, raw: unknown): DoneGuardConfig {
       tools: globList(visual.tools, base.visualTools.tools),
       images: globList(visual.images, base.visualTools.images).map(extension => extension.replace(/^\./, "")),
     },
+  };
+}
+
+function applyCause(base: CauseGuardConfig, raw: unknown): CauseGuardConfig {
+  if (!isObject(raw)) return base;
+  return {
+    enabled: boolean(raw.enabled, base.enabled),
+    claimsCause: probability(raw.claimsCause, base.claimsCause),
+    nudge: boolean(raw.nudge, base.nudge),
+    windowDays: Math.max(1, positiveInteger(raw.windowDays, base.windowDays)),
   };
 }
 
@@ -1011,14 +1059,15 @@ function applyWidget(base: WidgetConfig, raw: unknown): WidgetConfig {
   const template = (value: unknown, fallback: string) => (typeof value === "string" && value.trim() ? value : fallback);
   return {
     enabled: boolean(raw.enabled, base.enabled),
-    placement: raw.placement === "belowEditor" || raw.placement === "aboveEditor" ? raw.placement : base.placement,
-    barMode: raw.barMode === "live" || raw.barMode === "stack" ? raw.barMode : base.barMode,
+    placement: isOption(raw.placement, WIDGET_PLACEMENTS) ? raw.placement : base.placement,
+    barMode: isOption(raw.barMode, WIDGET_BAR_MODES) ? raw.barMode : base.barMode,
     shortcut: typeof raw.shortcut === "string" ? raw.shortcut.trim() : base.shortcut,
     panelWidth: typeof raw.panelWidth === "number" && Number.isSafeInteger(raw.panelWidth) && raw.panelWidth >= 20 ? raw.panelWidth
       : typeof raw.panelWidth === "string" && /^[1-9]\d?%$/.test(raw.panelWidth.trim()) ? raw.panelWidth.trim() : base.panelWidth,
     action: template(raw.action, base.action),
     stuck: template(raw.stuck, base.stuck),
     done: template(raw.done, base.done),
+    cause: template(raw.cause, base.cause),
     prose: template(raw.prose, base.prose),
     security: template(raw.security, base.security),
     context: template(raw.context, base.context),
@@ -1037,7 +1086,7 @@ function applyShared(base: WardenConfig, raw: Json): Pick<WardenConfig, "timeout
   };
 }
 
-function applyGuards(base: WardenConfig, raw: Json, timeoutMs: number, source: "user" | "project", warnings: string[]): Pick<WardenConfig, "action" | "stuck" | "done" | "slop" | "security" | "rules" | "rulesAtTurnStart" | "context" | "runaway" | "notify" | "judge" | "subagent" | "waste" | "compaction"> {
+function applyGuards(base: WardenConfig, raw: Json, timeoutMs: number, source: "user" | "project", warnings: string[]): Pick<WardenConfig, "action" | "stuck" | "done" | "cause" | "slop" | "security" | "rules" | "rulesAtTurnStart" | "context" | "runaway" | "notify" | "judge" | "subagent" | "waste" | "compaction"> {
   return {
     compaction: applyCompaction(base.compaction, raw.compaction, source),
     waste: applyWaste(base.waste, raw.waste),
@@ -1051,12 +1100,15 @@ function applyGuards(base: WardenConfig, raw: Json, timeoutMs: number, source: "
     action: applyAction(base.action, raw.action, timeoutMs, source, warnings),
     stuck: applyStuck(base.stuck, raw.stuck),
     done: applyDone(base.done, raw.done),
+    cause: applyCause(base.cause, raw.cause),
     slop: applySlop(base.slop, raw.slop),
     security: isObject(raw.security) ? {
       enabled: source === "project" ? projectSwitch("security.enabled", raw.security.enabled, base.security.enabled, warnings) : boolean(raw.security.enabled, base.security.enabled),
       threshold: source === "project" ? projectProbability("security.threshold", raw.security.threshold, base.security.threshold, warnings) : probability(raw.security.threshold, base.security.threshold),
       // Only the user file can turn masking off: a repository must not unmask credentials in its own agent's output.
       maskOutput: source === "user" ? boolean(raw.security.maskOutput, base.security.maskOutput) : base.security.maskOutput,
+      // A listed parameter excuses a share-link token, so it is user config only for the same reason as `maskOutput`.
+      shareLinkParams: source === "user" ? globList(raw.security.shareLinkParams, base.security.shareLinkParams) : base.security.shareLinkParams,
     } : base.security,
     context: isObject(raw.context) ? {
       enabled: boolean(raw.context.enabled, base.context.enabled),
@@ -1122,8 +1174,15 @@ export function applyUserOverrides(base: WardenConfig, raw: unknown): WardenConf
     learning: applyLearning(base.learning, raw.learning),
     conscience: applyConscience(base.conscience, raw.conscience),
     prefs: applyPrefs(base.prefs, raw.prefs),
+    trial: applyTrial(base.trial, raw.trial),
     warnings: [...(base.warnings ?? []), ...warnings],
   };
+}
+
+/** A project cannot turn the trial on: applyProjectOverrides never copies this section, so the user file is the only source. */
+function applyTrial(base: TrialConfig, raw: unknown): TrialConfig {
+  if (!isObject(raw)) return base;
+  return { silentHalf: boolean(raw.silentHalf, base.silentHalf) };
 }
 
 function applyWaste(base: WasteConfig, raw: unknown): WasteConfig {
@@ -1197,7 +1256,7 @@ function applyConscience(base: ConscienceConfig, raw: unknown): ConscienceConfig
   if (!isObject(raw)) return base;
   const skillsRaw = isObject(raw.skills) ? raw.skills : undefined;
   const toolsRaw = isObject(raw.tools) ? raw.tools : undefined;
-  const mode = typeof skillsRaw?.mode === "string" && ["off", "recommend", "load"].includes(skillsRaw.mode) ? skillsRaw.mode as ConscienceSkillMode : base.skills.mode;
+  const mode = isOption(skillsRaw?.mode, CONSCIENCE_SKILL_MODES) ? skillsRaw.mode : base.skills.mode;
   return {
     enabled: boolean(raw.enabled, base.enabled),
     skills: {

@@ -39,6 +39,14 @@
  * seed, plan, and order, skips every task x cell x repeat already recorded, and appends
  * the rest. A run that a stop or an interrupt cut short runs again.
  *
+ * Re-run pass (Corrections 4 of eval/preregistration.md): `--resume DIR --rerun-excluded`,
+ * only once the main pass is finished (every planned run recorded), runs every block that
+ * holds an `infraError` run once more (all three cells, the registered cell order). Its
+ * first runs move to the `superseded` list of `runs.json`, each with `supersededAt`, and
+ * their evidence folders move to `DIR/superseded/`; they leave every metric, and their Jev
+ * dollars stay in the batch total. One pass per batch: the exclusions after the pass are
+ * final. A stop during the pass resumes as `--resume` does.
+ *
  * Infrastructure failures: a run that ended on an error (the last assistant message of
  * the run, or of any of its turns, has stopReason `error`) or whose pi exited before
  * any assistant message is re-run after 1 and then 5 minutes (`--retry-delays`). An
@@ -46,6 +54,12 @@
  * `infraError`, and its whole block leaves the metrics (`excludedBlock`). Five final
  * failures in a row stop the batch with exit code 4; those runs are dropped and run
  * again on resume. A timeout is a task outcome.
+ *
+ * Stall rule (eval/stall.mjs): a pi process whose session log shows no new assistant
+ * message and no new tool result for `--stall-min` minutes (default 15) is killed. The run is an
+ * infrastructure failure (`infraError` starting "stalled"), re-run and excluded like an API
+ * error. `--timeout-min` is the timeout of a single-shot run; `--arc-timeout-min` the timeout
+ * of one turn of a multi-turn run (default: `--timeout-min`).
  *
  * Jev-error stop (eval/jev-stop.mjs): when a run of a cell that asks Jev ends with a
  * failed judgment (a failed request in its ledger, or a fallback in its warden trace:
@@ -56,7 +70,10 @@
  * exited, with no fallback in the trace, is recorded as `abandonedJevRequests` and stops
  * nothing. A run killed at the timeout whose ledger cannot be read stops nothing either,
  * but its Jev cost is unknown (`cost.jevUnknown`): it leaves the dollar metric only, and
- * the report counts it. A batch with `--typesafe-cap` spends its judged-request allowance on purpose
+ * the report counts it. A run whose one failed request is a cancelled trace-only sample
+ * (the guard's second request on one judged call in twenty, cancelled by its own 5-second
+ * deadline; the proof is in eval/jev-stop.mjs) is recorded as `cancelledTraceSamples: 1`
+ * and stops nothing. A batch with `--typesafe-cap` spends its judged-request allowance on purpose
  * and does not apply the rule.
  *
  * Jev dollar cap: `--jev-usd-cap N` sums the Jev dollars of every finished run's ledger
@@ -69,6 +86,7 @@
  *   node scripts/eval-ab.mjs --tasks t6-dsn,t7-todo --max-runs 4 --keep
  *   node scripts/eval-ab.mjs --turns 12 --tasks t16-decay      # decay arc, one long session
  *   node scripts/eval-ab.mjs --resume eval/reports/<batch folder>   # continue a stopped batch
+ *   node scripts/eval-ab.mjs --resume eval/reports/<batch folder> --rerun-excluded   # run its excluded blocks once more
  *   node scripts/eval-ab.mjs --suite weak --repeats 2 --typesafe-cap 400 \
  *     --model deepseek/deepseek-flash --waste both
  *
@@ -91,7 +109,7 @@
 
 import { parseArgs } from "node:util";
 import { spawn, execFileSync } from "node:child_process";
-import { cp, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync, renameSync, writeFileSync as writeFileSyncNow } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { basename, join, resolve, dirname } from "node:path";
@@ -103,8 +121,9 @@ import { filterEnv, filteredNames } from "../eval/env.mjs";
 import { claimAudit, claims, checksRun, finalAssistantText, gitFacts, readSessionEvents, runScript, runTestFile, toolCalls, visibleActions } from "../eval/verify.mjs";
 import { outcomeAxis, wasteAxis } from "../eval/waste.mjs";
 import { jevDollars, jevUsage, runCost } from "../eval/cost.mjs";
-import { abandonedJevRequests, jevFailure } from "../eval/jev-stop.mjs";
-import { DEFAULT_SEED, RETRY_DELAYS_MS, blockOrder, firstRuns, infraReason, infraSection, infraCounts, markExclusions, recoveredErrors, runBatch, runKey } from "../eval/batch.mjs";
+import { abandonedJevRequests, jevCheck } from "../eval/jev-stop.mjs";
+import { createStallWatch, progressCount } from "../eval/stall.mjs";
+import { DEFAULT_SEED, RETRY_DELAYS_MS, blockOrder, firstRuns, infraReason, infraSection, infraCounts, markExclusions, recoveredErrors, rerunExcluded, runBatch, runKey } from "../eval/batch.mjs";
 import { weakTasks, weakTaskById } from "../eval/weak-tasks.mjs";
 import { buildWeakReport, callsWithResults, judgedRequests, repeatedFailures, snapshot, steersInOrder, traceGuards, turnsOf } from "../eval/weak.mjs";
 
@@ -129,18 +148,21 @@ const { values: cli } = parseArgs({
     model: { type: "string" },
     thinking: { type: "string" },
     "timeout-min": { type: "string" },
+    "arc-timeout-min": { type: "string" },
+    "stall-min": { type: "string" },
     "retry-delays": { type: "string" },
     seed: { type: "string" },
     resume: { type: "string" },
     out: { type: "string" },
     keep: { type: "boolean", default: false },
     "dry-run": { type: "boolean", default: false },
+    "rerun-excluded": { type: "boolean", default: false },
   },
 });
 
 /** The flags that define a batch: a resumed batch takes them from its runs.json and refuses a different value. */
-const PLAN_KEYS = ["repeats", "tasks", "suite", "waste", "typesafe-cap", "provider", "model", "thinking", "turns", "seed", "timeout-min"];
-const PLAN_DEFAULTS = { repeats: "1", suite: "ab", "timeout-min": "12", seed: String(DEFAULT_SEED) };
+const PLAN_KEYS = ["repeats", "tasks", "suite", "waste", "typesafe-cap", "provider", "model", "thinking", "turns", "seed", "timeout-min", "arc-timeout-min", "stall-min"];
+const PLAN_DEFAULTS = { repeats: "1", suite: "ab", "timeout-min": "12", "stall-min": "15", seed: String(DEFAULT_SEED) };
 const RESUME_DIR = cli.resume ? resolve(cli.resume) : null;
 let stored = null;
 if (RESUME_DIR) {
@@ -178,11 +200,20 @@ if (!Number.isInteger(SEED) || (JEV_USD_CAP !== null && !Number.isFinite(JEV_USD
   console.error("--seed must be an integer, --jev-usd-cap a number of dollars, --retry-delays seconds like 60,300");
   process.exit(2);
 }
+if (cli["rerun-excluded"] && !RESUME_DIR) {
+  console.error("--rerun-excluded: needs --resume DIR; it runs the excluded blocks of a finished batch once more");
+  process.exit(2);
+}
 
 const REPEATS = Math.max(1, Number(values.repeats));
 const CONCURRENCY = Math.max(1, Number(values.concurrency));
 const TURNS = values.turns ? Math.max(1, Number(values.turns)) : 0;
 const TIMEOUT_MS = Number(values["timeout-min"]) * 60_000;
+// One turn of a multi-turn run has its own timeout; it defaults to the single-shot one.
+const ARC_TIMEOUT_MS = (values["arc-timeout-min"] ? Number(values["arc-timeout-min"]) : Number(values["timeout-min"])) * 60_000;
+// The stall rule (eval/stall.mjs): no new assistant message or tool result for this long kills the run.
+const STALL_MS = Number(values["stall-min"]) * 60_000;
+const STALL_POLL_MS = Math.min(10_000, Math.max(200, STALL_MS / 4));
 if (!["ab", "weak"].includes(values.suite)) {
   console.error(`Unknown suite ${values.suite}. Available: ab, weak`);
   process.exit(2);
@@ -311,6 +342,9 @@ function providerPackages() {
  * is never in settings — the warden cells load it explicitly with `-e`, so the
  * cells differ by exactly one extension, and the two warden cells differ by one
  * config switch (`typesafe`, the consent that turns Jev judgments on).
+ * Only a cell that asks Jev gets the TypeSafe key: an agent in another cell
+ * could otherwise turn Jev on by itself, as 6 `warden-offline` runs of the v4
+ * batch did.
  */
 const GLOBAL_AGENT = join(homedir(), ".pi", "agent");
 
@@ -322,8 +356,8 @@ async function prepareAgentDir(base, allowance = null, waste = null, consent = t
   for (const f of ["auth.json", "commandcode-models.json", "models.json", "models-store.json"]) {
     if (existsSync(join(GLOBAL_AGENT, f))) await cp(join(GLOBAL_AGENT, f), join(agentDir, f));
   }
-  // pi-typesafe stores its key in <agentDir>/pi-typesafe/auth.json — copy without logging.
-  if (existsSync(join(GLOBAL_AGENT, "pi-typesafe", "auth.json"))) {
+  // pi-typesafe stores its key in <agentDir>/pi-typesafe/auth.json; copy it without logging, and only for a cell that asks Jev.
+  if (consent && existsSync(join(GLOBAL_AGENT, "pi-typesafe", "auth.json"))) {
     await cp(join(GLOBAL_AGENT, "pi-typesafe", "auth.json"), join(agentDir, "pi-typesafe", "auth.json"));
   }
   const settings = {
@@ -355,6 +389,7 @@ let interrupted = false;
 function runPi(project, agentDir, sessionDir, prompt, cell, env, extra = [], timeoutMs = TIMEOUT_MS) {
   return new Promise((resolveP) => {
     const started = Date.now();
+    const watch = createStallWatch({ stallMs: STALL_MS, now: started, count: progressCount(readSessionEvents(sessionDir)) });
     const child = spawn("pi", [...piArgs(cell, sessionDir, extra), "--", prompt], {
       cwd: project,
       env,
@@ -363,13 +398,18 @@ function runPi(project, agentDir, sessionDir, prompt, cell, env, extra = [], tim
     children.add(child);
     let out = "", err = "";
     let timedOut = false;
+    let stalled = false;
     const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
+    const poll = setInterval(() => {
+      if (watch.check(progressCount(readSessionEvents(sessionDir)), Date.now())) { stalled = true; child.kill("SIGKILL"); }
+    }, STALL_POLL_MS);
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d));
     child.on("close", (code) => {
       children.delete(child);
       clearTimeout(timer);
-      resolveP({ code, out, err, timedOut, seconds: (Date.now() - started) / 1000 });
+      clearInterval(poll);
+      resolveP({ code, out, err, timedOut: timedOut && !stalled, stalled, seconds: (Date.now() - started) / 1000 });
     });
   });
 }
@@ -523,17 +563,19 @@ async function runArc(task, cell, repeat, allowance = null) {
   let previousSteers = 0;
   let seen = 0;
   let recovered = 0;
+  let stderr = "";
   try {
     for (let i = 0; i < prompts.length; i++) {
-      const pi = await runPi(project, agentDir, sessions, prompts[i], cell, env, i === 0 ? [] : ["-c"]);
+      const pi = await runPi(project, agentDir, sessions, prompts[i], cell, env, i === 0 ? [] : ["-c"], ARC_TIMEOUT_MS);
       if (interrupted) return { aborted: true, pi, base, checks };
+      stderr += pi.err;
       const events = readSessionEvents(sessions);
       // Only this turn's messages count: an earlier turn's reply says nothing about this pi process.
       const turnEvents = events.slice(seen);
       const infra = infraReason(turnEvents, pi);
       seen = events.length;
       recovered += recoveredErrors(turnEvents);
-      if (infra) return { infra: `turn ${i + 1}: ${infra}`, pi: { ...pi, seconds: turns.reduce((t, x) => t + x.seconds, 0) + pi.seconds }, base, checks };
+      if (infra) return { infra: `turn ${i + 1}: ${infra}`, pi: { ...pi, err: stderr, seconds: turns.reduce((t, x) => t + x.seconds, 0) + pi.seconds }, base, checks };
       const calls = toolCalls(events);
       const text = finalAssistantText(events);
       const found = claims(text);
@@ -565,7 +607,7 @@ async function runArc(task, cell, repeat, allowance = null) {
     });
     return {
       record: { ...scored, turns },
-      pi: { code: 0, timedOut: turns.some((t) => t.timedOut), seconds: turns.reduce((s, t) => s + t.seconds, 0), out: "", err: "" },
+      pi: { code: 0, timedOut: turns.some((t) => t.timedOut), seconds: turns.reduce((s, t) => s + t.seconds, 0), out: "", err: stderr },
       base, checks,
     };
   } catch (error) {
@@ -596,11 +638,41 @@ async function main() {
   const taskIds = SELECTED.map((t) => t.id);
   const blocks = blockOrder({ taskIds, cells: CELLS, repeats: REPEATS, seed: SEED }).map((b) => ({ ...b, family: byId(b.task).family ?? (WEAK ? "weak" : "rules") }));
   const plan = { ...Object.fromEntries(PLAN_KEYS.filter((k) => values[k] !== undefined).map((k) => [k, values[k]])), tasks: taskIds.join(",") };
-  const state = { runs: stored?.runs ?? [], jevUsd: stored?.jevUsd ?? 0, stops: stored?.stops ?? [] };
+  const state = { runs: stored?.runs ?? [], jevUsd: stored?.jevUsd ?? 0, stops: stored?.stops ?? [], superseded: stored?.superseded ?? [], reruns: stored?.reruns ?? [] };
   const plannedRuns = values["max-runs"] ? firstRuns(blocks, Number(values["max-runs"])) : blocks;
   const queue = plannedRuns.flatMap((b) => b.cells.map((cell) => ({ task: byId(b.task), cell, repeat: b.repeat })));
-  const done = new Set(state.runs.map(runKey));
-  const remaining = queue.filter((q) => !done.has(runKey({ task: q.task.id, cell: q.cell, repeat: q.repeat })));
+  const pending = () => {
+    const done = new Set(state.runs.map(runKey));
+    return queue.filter((q) => !done.has(runKey({ task: q.task.id, cell: q.cell, repeat: q.repeat })));
+  };
+  let remaining = pending();
+
+  // Corrections 4 (eval/preregistration.md): --rerun-excluded runs the excluded blocks of a
+  // finished batch once more, all three cells, and never a second pass.
+  if (cli["rerun-excluded"]) {
+    if (state.reruns.length) {
+      console.error("--rerun-excluded: this batch already ran its re-run pass; the exclusions after the pass are final");
+      process.exit(2);
+    }
+    if (remaining.length) {
+      console.error(`--rerun-excluded: the main pass is not finished: ${remaining.length} planned run(s) left`);
+      process.exit(2);
+    }
+    const pass = rerunExcluded(state, plannedRuns);
+    if (!pass.blocks.length) {
+      console.log("--rerun-excluded: no excluded block; nothing runs again");
+      return;
+    }
+    remaining = pending();
+    console.log(`re-run pass: ${pass.blocks.length} excluded block(s) run once more, ${pass.runs.length} first run(s) move to superseded`);
+    if (!values["dry-run"]) {
+      await mkdir(join(outDir, "superseded"), { recursive: true });
+      for (const run of pass.runs) {
+        const name = `${run.task}-${run.cell}-r${run.repeat}`;
+        try { await rename(join(outDir, "runs", name), join(outDir, "superseded", name)); } catch { /* an evidence folder is best effort */ }
+      }
+    }
+  }
 
   console.log(`eval-ab: ${WEAK ? "weak suite, " : ""}${SELECTED.length} tasks x ${CELLS.length} cells x ${REPEATS} repeat(s), ` +
     `${queue.length} run(s) in ${plannedRuns.length} block(s) at concurrency ${CONCURRENCY}, seed ${SEED}` +
@@ -640,6 +712,8 @@ async function main() {
       stamp: stored?.stamp ?? stamp, seed: SEED, plan, jevUsd: state.jevUsd,
       args: { ...values, extension: values.extension?.map((p) => p.split("/").pop()), out: values.out?.split("/").pop() },
       ...(current ? { stoppedBy: current } : {}), stops: state.stops, runs: sorted,
+      ...(state.superseded.length ? { superseded: state.superseded } : {}),
+      ...(state.reruns.length ? { reruns: state.reruns } : {}),
     }, null, 2));
   };
   const persist = () => {
@@ -681,10 +755,13 @@ async function main() {
       return { aborted: true, jevUsd };
     }
     // A failed Jev judgment in a run that asks Jev ends the batch and the run is not counted.
-    const jevError = asksJev(cell) && allowance === null ? jevFailure({ agentDir, traceDir: join(base, "trace"), killed: pi.timedOut }) : null;
+    const { failure: jevError, cancelledTraceSamples } = asksJev(cell) && allowance === null
+      ? jevCheck({ agentDir, traceDir: join(base, "trace"), killed: pi.timedOut || pi.stalled, startedAt, endedAt: new Date().toISOString() })
+      : { failure: null, cancelledTraceSamples: 0 };
     const full = record ? {
       ...record, startedAt, piExit: pi.code, timedOut: pi.timedOut, seconds: Math.round(pi.seconds),
       ...(asksJev(cell) ? { abandonedJevRequests: abandonedJevRequests(agentDir) } : {}),
+      ...(cancelledTraceSamples ? { cancelledTraceSamples } : {}),
     } : null;
     try {
       const evidence = join(outDir, "runs", `${task.id}-${cell}-r${repeat}`);
@@ -734,7 +811,7 @@ async function main() {
   // The report builders leave out the excluded blocks themselves.
   const md = WEAK ? buildWeakReport({ runs: state.runs, stamp, args: values, cap: TYPESAFE_CAP }) : buildReport({ runs: state.runs, stamp, args: values });
   md.splice(2, 0, `Block order: repeat by repeat, task by task; the cells of each block shuffled with seed ${SEED}.`, "");
-  md.push(...infraSection(state.runs, blocks.length));
+  md.push(...infraSection(state.runs, blocks.length, state.reruns));
   await writeFile(join(outDir, "report.md"), scrubPaths(md.join("\n")));
   persist();
   console.log(`\nreport: ${join(outDir, "report.md")}`);

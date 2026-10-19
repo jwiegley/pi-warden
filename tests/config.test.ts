@@ -40,6 +40,17 @@ test("defaults: guards on, steer mode, TypeSafe consent off, nudges on", () => {
   assert.equal(config.timeoutMs, config.action.timeoutMs);
 });
 
+test("subagent observer defaults on and accepts only boolean overrides", () => {
+  const base = defaultConfig();
+  assert.equal(base.subagent.observer, true);
+  for (const apply of [applyUserOverrides, applyProjectOverrides]) {
+    assert.equal(apply(base, { subagent: { observer: false } }).subagent.observer, false);
+    for (const observer of [undefined, "false", 0, null]) {
+      assert.equal(apply(base, { subagent: { observer } }).subagent.observer, true);
+    }
+  }
+});
+
 test("should-proceed steer parser accepts booleans and defaults invalid or missing values", () => {
   const base = defaultConfig();
   assert.deepEqual(base.action.shouldProceed, { threshold: 0.6, steer: false });
@@ -224,6 +235,13 @@ test("a project file with security.maskOutput false leaves output masking on", (
   assert.equal(applyUserOverrides(defaultConfig(), { security: { maskOutput: false } }).security.maskOutput, false, "the user file can");
   const userOff = applyUserOverrides(defaultConfig(), { security: { maskOutput: false } });
   assert.equal(applyProjectOverrides(userOff, { security: { maskOutput: true } }).security.maskOutput, false, "nor can a project file turn it back on over the user's choice");
+});
+
+test("a project file cannot name a security.shareLinkParams entry", () => {
+  assert.deepEqual(applyProjectOverrides(defaultConfig(), { security: { shareLinkParams: ["xsec_token"] } }).security.shareLinkParams, [], "the project file cannot name a parameter");
+  assert.deepEqual(applyUserOverrides(defaultConfig(), { security: { shareLinkParams: [" xsec_token ", 7, "", null] } }).security.shareLinkParams, ["xsec_token"], "the user file trims and drops non-strings and blanks");
+  const user = applyUserOverrides(defaultConfig(), { security: { shareLinkParams: ["xsec_token"] } });
+  assert.deepEqual(applyProjectOverrides(user, { security: { shareLinkParams: ["other"] } }).security.shareLinkParams, ["xsec_token"], "a project file cannot replace the user's list");
 });
 
 // Legacy and malformed config sections must preserve the objects dereferenced by event handlers.

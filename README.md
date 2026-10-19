@@ -39,6 +39,7 @@ Most guardrails stop and ask you. pi-warden tells **the agent** what it got wron
 | Your agent… | pi-warden… |
 | --- | --- |
 | says "done" with no test, build, or lint behind it | sends it back to prove it |
+| names a likely cause ("probably", "ask the team") with nothing checked that run | sends it back to check it with its own tools, or state plainly that it is unverified |
 | breaks a rule in your `pi-warden.md` or `AGENTS.md` | quotes the exact rule it broke |
 | is about to `git push --force`, `reset --hard`, `rm -rf`, `DROP` | holds it before it runs. A built-in pattern holds the destructive ones with no key at all; with Jev on, a score of 0.9 or more for "cannot be undone" holds too |
 | retries the same failing fix for the third time | asks for a new hypothesis |
@@ -73,6 +74,7 @@ Every guard and feature, its default, and its status. Defaults are `defaultConfi
 | [Security](docs/guards.md#security) | Flags risky written code and prompt injection in tool output; masks credentials, but leaves code values such as a call or an index alone | On | Stable |
 | [Stuck](docs/guards.md#stuck) | Asks for a new hypothesis when the agent repeats a failing approach | On | Stable |
 | [Done-check](docs/guards.md#done-check) | Sends an unverified "done" back for a check; after a UI change, a visual check | On | Stable |
+| [Cause-check](docs/guards.md#cause-check) | Sends a final reply back to check a stated cause, or to say plainly that it is unverified; the same unchecked cause on a later day gets a stronger steer | On | Stable |
 | [Runaway](docs/guards.md#runaway) | Stops a reply that repeats itself, offline | On | Stable |
 | [Context saver](docs/guards.md#context-saver) | Replaces large or duplicate tool output with an excerpt and a saved full copy | On | Stable |
 | ↳ Repeated user messages | Cuts repeated runs in your own messages too | Off. `context.dedupeMessages` | Stable |
@@ -83,11 +85,13 @@ Every guard and feature, its default, and its status. Defaults are `defaultConfi
 | ↳ Session tip | Adds one paragraph about call cost to the system prompt | Off. `waste.tip` | Stable |
 | [Open loops and recall](docs/guards.md#open-loops-and-recall) | `warden_loops` keeps the agent's promises; `warden_recall` lists what it already tried | On, no switch | Stable |
 | [Subagent triage](docs/guards.md#subagent-triage) | Wakes the agent only for a subagent report that needs it | On | Stable |
+| [Token Guardian observer](docs/guards.md#token-guardian-observer) | Records Jev's answers to redacted supervision triggers in the trace; never answers Guardian or acts on them | On with Jev consent | Record-only |
 | [Judge cooldown](docs/guards.md#judge-cooldown) | Pauses Jev requests after repeated failures, so a dead backend costs no timeouts | On, no switch | Stable |
 | [Steer budget](docs/guards.md#steer-messages) | At most 3 non-critical steers per run; the rest go to the trace | On | Stable |
 | [Adaptive steers](docs/guards.md#adaptive-steers-per-model) | Makes a steer kind trace-only for a model that rarely follows or often disputes it | On | Stable |
 | Steers and notices in the transcript | Shows steers and per-call notices in the chat, not only in the trace | Off. `steerVisible`, `notices` | Stable |
 | [Desktop notifications](docs/guards.md#desktop-notifications) | Holds, confirm dialogs, and runaway stops reach the desktop or your relay | Off. `notify.enabled` | Stable |
+| [Herdr pane state](docs/guards.md#herdr-pane-state) | In a herdr pane, a waiting confirm dialog shows as blocked in the herdr sidebar instead of working | On, no switch | Stable |
 | [Conscience](docs/guards.md#conscience) | Recommends a skill or tool the agent is missing; ranks candidates on your machine first and sends one request, or none | Off. `conscience.enabled` | Beta |
 | Learning from holds | Keeps each judged call in a local database with its Pi session id and, for a hold, what happened next (`approved`, `declined`, `replanned`, `abandoned`); a call that was not held keeps only the judge data, and is pruned after 90 days (`learning.allowedRetentionDays`; holds after 365). `/warden recommend` suggests threshold changes from it. Nothing is sent | On | Stable |
 | Config surface | A project file can only make the action guard and security stricter, a value that cannot be applied as written is shown once as a warning, and `deny` and `block` mean the same in every rule kind | On, no switch | Stable |
@@ -168,3 +172,11 @@ npm run check        # typecheck + offline tests + build
 ```
 
 MIT licensed.
+
+## Maintained fork
+
+This fork tracks upstream v1.11.2 and pins the `jwiegley/pi-typesafe` v0.10.0
+source archive by commit. `npm ci && npm run check` builds that dependency
+before Warden. Nix substitutes the same fork's separately built artifact.
+Model selection stays in user configuration: select an OpenRouter endpoint
+with `defaultModel: "~typesafe/jev-latest"`; neither fork changes SDK model defaults.

@@ -169,13 +169,13 @@ test("the config panel keeps a refused save pending and shows the reason", async
   panel.handleInput("enter");
   panel.handleInput("s");
   assert.equal(await readFile(path, "utf8"), "{ not json", "a refused save leaves the file alone");
-  assert.ok(panel.render(120).join("\n").includes(UNREADABLE_WRITE), "the reason replaces the key hints");
+  assert.ok(panel.render(1000).join("\n").includes(UNREADABLE_WRITE), "the write refusal is visible in the panel notice");
 
   // Fixing the file by hand lets the same pending edit save.
   await rm(path, { force: true });
   panel.handleInput("s");
   assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { enabled: false }, "the edit was still pending");
-  assert.ok(!panel.render(120).join("\n").includes(UNREADABLE_WRITE), "the reason is cleared");
+  assert.ok(!panel.render(1000).join("\n").includes(UNREADABLE_WRITE), "the reason is cleared");
 });
 
 test("the once-per-session notice says why judgments are off", () => {

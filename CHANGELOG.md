@@ -6,6 +6,182 @@ How to keep this current: add the entry in the same pull request as the change, 
 
 ## Unreleased
 
+<!-- Empty. Next release starts here. -->
+
+## 1.11.2
+
+### Fixed
+
+- The action guard's floor no longer holds a bash call for text the shell never runs. Every pattern check (the built-in rules, the SQL and git state checks, user `commandRules`, and path rules on the command surface) reads a command and a script body without shell comments, the same comment scan the judge request uses. A `#!/bin/sh` first line no longer keeps every quoted `echo`/`printf` message in scope (the data scan read it as a call to `sh`), and a message that holds `;`, `|`, or `&&` inside its quotes is no longer cut into commands. The hit lines of a script body leave out its comment lines.
+- A `grep`, `sed`, or `rtk grep` of a file, with `\|` in its quoted pattern, no longer reads that file as a script that runs. Script detection cut the command at every `|`, also inside quotes, so `down=" scripts/x.py` read as an assignment and the file as the command; it now cuts only where the shell does. A command with a substitution, an unclosed quote, `eval`, or `sh -c` keeps the old cut, so every script read before is still read. ([#190](https://github.com/DevMortimer/pi-warden/issues/190))
+- The floor reads line continuations as bash does. A delete split by a backslash-newline (`r\<newline>m -rf ~`, `rm \<newline>-rf ~`) was not held, and neither was a script run as `sh \<newline>a.sh`. The comment scan now joins each backslash-newline that bash removes: outside quotes, in double quotes and `${...}`, and in a heredoc body with an unquoted delimiter, but not in single quotes, `$'...'`, a quoted heredoc body, or a comment. A backslash-newline before a script run (`cd . && \<newline>  sh a.sh`, also `npm run` and `make`) no longer hides the script from the floor or the ask gate.
+- A delete after a here-string or a partly quoted heredoc delimiter is held again. The data scan found heredocs with a line regex that read `<<<` and a `<<` inside quotes as the start of a heredoc, and took `E` as the delimiter of `<<E"O"F`, so every later line was blanked as heredoc data. It now takes heredocs from the comment scan, which skips here-strings, quotes, and comments, removes quotes from the delimiter, and joins a backslash-newline in an unquoted body before it matches the delimiter; a command that scan cannot read keeps every line in scope.
+- The ask gate reads the command the way the floor does, without shell comments and with quoted messages and heredoc data blanked. A push or a delete that appears only in a comment or in a quoted `echo` message no longer sends a judge request.
+
+### Tests
+
+- A differential test runs each input through `bash -c` with a `touch "$MARK"` twin in place of the delete: the floor holds an input exactly when bash creates the marker (13 inputs it stops holding, 16 it keeps holding, among them a delete inside `$(...)` on a heredoc line that starts with `#`, and a delete on the line after a comment that holds an apostrophe). Unit tests pin the issue 190 command with its user rule, and every way of running a script (`sh`, `bash`, `./`, `.`, `source`, `npm run`), also next to a read of the same file.
+- The differential test adds 28 inputs with backslash-newlines, here-strings, and quoted or split heredoc delimiters, typed and in script bodies with `#!/bin/sh`, `#!/bin/bash`, `#!/usr/bin/env bash`, or no first line; the comment-scan output test adds 8 inputs whose output bash must print unchanged. Unit tests hold each of them through `matchPatterns`, check that the ask gate still asks for a script named after a backslash-newline, and check that the comment, echo message, and `sed` shapes still run.
+- A judge-call count through `evaluateAction` pins that a push only in a comment sends no request, and that the same push as a second command sends one.
+
+## 1.11.1
+
+### Fixed
+
+- `/warden index` now finalizes the entries-only files its own prompt asks the model to write. The entries-only fallback ran only when the strict read had already found a complete file, so an `{ "entries": [...] }` file never got its metadata, its rejections were never reported, and every later session loaded the index as missing and repeated the "run /warden index" nudge. The fallback now runs whenever the strict read finds no file, and rejected entries are reported. ([#185](https://github.com/DevMortimer/pi-warden/issues/185))
+
+## 1.11.0
+
+### Added
+
+- SubQ backend: `"typesafeBackend": "subq"` in the user config sends judgments to `https://api.subq.ai` with the model `subq-snap-preview`, using the key in `SUBQ_API_KEY`. ([Configuration](docs/configuration.md#user-config))
+
+### Changed
+
+- pi-typesafe 0.10.0.
+- Every judgment fits the backend's question limit: 16 questions per request on SubQ, 32 on the other backends. The rules guard, the end-of-run turn rules, the turn-start rules reminder, `/warden rules check`, the context filter, relevance compaction, and the conscience split a judgment with more questions into several requests and merge the answers by question id; the conscience repeats its disposition question in each request. On the other backends every guard sends the same requests as before, and a judge an extension author builds without `limits` keeps the 32-question limit. On SubQ a judgment with more than 16 questions uses more of `maxRequests`.
+- The action guard and `/warden rules calibrate` also fit the backend's question limit. On SubQ, an action guard call with more than 16 questions (one per `rm` target the request does not authorize, plus any `questions` a library caller adds) and a calibration sample with more than 16 rules split into requests of at most 16, sent together, with the answers merged by question id; the verdict and the scores are the same as from one request. No action guard question repeats in each request, because none of them reads another's answer. On the other backends, and for a judge without `limits`, both send the same requests as before.
+
+## 1.10.0
+
+### Changed
+
+- pi-warden now declares support for Pi 1.x: the `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` peer ranges go from `>=0.85.1 <1` to `>=0.85.1 <2`, so installing pi-warden next to Pi 1.x no longer fails with a peer dependency conflict. npm still prints an `ERESOLVE overriding peer dependency` warning, because pi-typesafe declares Pi `<1`.
+
+### Fixed
+
+- A run that a custom message starts no longer crashes the turn-start handler. Pi versions that fire `before_agent_start` for such a run (for example, a background subagent's report) give it no prompt text; the turn-start rules reminder and the conscience assessment now skip that run and write a `custom_trigger` line to the trace.
+
+## 1.9.0
+
+### Changed
+
+- The action guard no longer lets text the agent writes into a shell comment sway Jev. The command in the request state and the `script_lines` are sent without shell comments (a `#` at the start of a word, outside quotes, including quotes that span lines, and heredoc bodies, and not `$#` or `${#…}`); a command the scan cannot read with certainty (an unclosed quote, backticks, arithmetic) is sent unchanged, while the confirm dialog and the trace keep the full command. Agent-bound reasons no longer carry Jev scores: the held-call message, the headless warn steer, the declined-call reason, and the intent, off-task, should-proceed, and large-output steers keep the words (`irreversible`, `possibly irreversible`) without the numbers, and the dialog, notices, trace, holds, and learning records keep them. ([Guards](docs/guards.md))
+
+## 1.8.1
+
+### Fixed
+
+- Repeated runs (`context.dedupeRuns`) no longer cut text the model never saw. On the `claude-bridge` provider, Claude Code saves a tool result over its MCP output limit to a file and gives the model only a "saved to file" message; pi-warden counted that result as seen and then cut later reads of the saved file as repeats. A tool result over 20,000 characters on `claude-bridge` (judged by the provider of the call that made it) is no longer counted as seen, and a `read` or `bash` call that names a file in a Claude Code `tool-results` directory is never cut. Other providers, and `claude-bridge` results under the limit, are cut as before. ([Guards](docs/guards.md))
+
+## 1.8.0
+
+### Added
+
+- `trial.silentHalf` (default `false`, user config only): a randomized comparison of the guards in real work. Each session is put in arm `live` or `silent`, 50/50 from its session id, so a resumed session keeps its arm. A `silent` session judges as usual — every guard runs and every request is made — but records each delivery it would have made instead of sending it: rules, slop, prose, stuck and repeat, done-check, cause-check, open loops, intent-mismatch, off-task, should-proceed, large-output, and action-warning steers, conscience tips, preference notes, turn-start rules reminders, compact evidence, subagent triage wakes, call-waste notes, and tool-output compression. Everything that protects data stays live in both arms: irreversible calls are held or blocked, credential values are masked, security, credential, and prompt-injection notices are delivered, and runaway stops and the warnings about pi-warden itself are unaffected. One `pi-warden-trial` custom session entry names the arm at session start, and one per withheld delivery carries its kind, guard, time, and the redacted text clipped to 300 characters; custom entries stay out of the model's context, so both arms can be read back from the session logs. With the setting off, no entry is written and no delivery changes. ([Configuration](docs/configuration.md#user-config))
+
+## 1.7.1
+
+### Added
+
+- A/B benchmark tooling, registration v4 (`eval/preregistration.md`): the run moves to the CheapestInference flat-rate subscription with no paid agent model (`cheapestinference/deepseek-v4.1-flash`, then `cheapestinference/mimo-v2.5`), the models run one after the other at concurrency 3, the repeats (6 and 7) are sized from the smoke timings to about 24 hours each, and the Jev cap is $3 per model. The stopped v3 batches are named as a stopped pilot and never analysed.
+- A/B batch Jev-error stop (`eval/jev-stop.mjs`): a run whose one failed Jev request is a cancelled trace-only sample (the guard's second request on one judged call in twenty, cancelled by its own 5-second deadline) is recorded as `cancelledTraceSamples: 1` and no longer stops the batch, found by time (the entry with a `jev:` line nearest to the failed request's time is within 1,000 ms of it and has no off-task answer) rather than by entry number; every other failure still does. Repo tooling; rides along with the next release.
+- A/B batch re-run pass (`scripts/eval-ab.mjs`, `eval/batch.mjs`, Corrections 4 of `eval/preregistration.md`): `--resume <batch folder> --rerun-excluded`, once a model's main pass is finished, runs every block that holds an `infraError` run once more (all three cells, registered cell order); the first runs move to `superseded` in `runs.json` with `supersededAt` and their evidence folders to `superseded/` in the batch folder, and leave every metric while their Jev dollars stay in the batch total. One pass per batch: the exclusions after it are final and the 10% limit applies to them; a stop during the pass resumes with `--resume`. Repo tooling; rides along with the next release.
+- A stall rule for batch runs (`eval/stall.mjs`, `--stall-min`, default 15): a pi process whose session log shows no new assistant message or tool result for that long is killed, and the run is an infrastructure failure, re-run and excluded like an API error. `--arc-timeout-min` sets the timeout of one turn of a multi-turn run.
+- Equivalent dollars for the subscription models (`eval/config.mjs`): `cheapestinference/deepseek-v4.1-flash` at DeepSeek's `deepseek-flash` rates by call timestamp, `cheapestinference/mimo-v2.5` at Xiaomi's official MiMo-V2.5 price.
+- `scripts/eval-timing.mjs`: per-run wall time, per-call queue wait and generation time, and runs per hour of a batch folder, from timings only; `node eval/power.mjs --registered R1,R2` prints the power at the registered sizes.
+- A/B thesis decision tool (`eval/decide.mjs`, `scripts/thesis-decide.mjs`): the decision rules of `eval/preregistration.md` ("Decision rules", Corrections 7) computed from one model's `runs.json` (the per-run values, the paired blocks, the exact McNemar p, the one-sided Clopper-Pearson lower bound, the violation rate ratio and its lower bound, the paired bootstrap, the Wald and delta-method sensitivity bounds, and the decision of each rule and of the model); `node scripts/thesis-decide.mjs <runs.json> --label A --blocks 120` prints the table (`--json` for JSON), and `--metrics FILE` writes the analysis set's per-run values. Tests on made-up data in `tests/eval-decide.test.ts`. Repo tooling; rides along with the next release.
+- A/B thesis decision tool metrics input (`scripts/thesis-decide.mjs`, `eval/decide.mjs`): the same script also reads a `--metrics` file (the analysis set's `task`, `family`, `repeat`, `cell`, `s`, `v`, `c`) and prints the same decision table, with a first line that says the input was a metrics file. Repo tooling; rides along with the next release.
+- A/B thesis pooled view (`eval/decide.mjs`, `scripts/thesis-pooled.mjs`): the two models' runs pooled after the run to describe the three thesis claims (the hallucination proxy `h`, the pooled paired success, and the token count `t` with medians, the 90th percentile, the count over 1,000,000, and the paired warden-vs-control ratio), labelled post hoc and deciding nothing; the `--metrics` rows of `scripts/thesis-decide.mjs` also carry `h` and `t`. Repo tooling; rides along with the next release.
+- A/B thesis registration, Corrections 5 to 7 (`eval/preregistration.md`): the stops and other events of both batches are recorded, and the analysis methods behind the decision rules' bounds and p-value are fixed before any of them is computed.
+- A/B thesis report (`eval/reports/2026-10-10-thesis-v4/README.md`): the registered decision rules applied to both models of the v4 batch, with the decision tables, per-cell tables, pair counts and bounds, sensitivity bounds, the secondary trap-capable analysis, and the infrastructure and power limits; both models show success not more than 5 points below control (one-sided 95% lower bounds +0.00 and -2.14 points), model B (`cheapestinference/mimo-v2.5`) also supports the rule-violation and Jev-increment rules, and the cost rule is inconclusive on both.
+
+### Fixed
+
+- A/B run key isolation (`scripts/eval-ab.mjs`): the harness copies the TypeSafe key into a run's agent folder only for a cell that asks Jev, so an agent in any other cell cannot turn Jev on by itself, as 6 `warden-offline` runs of the v4 batch did. Repo tooling; rides along with the next release.
+- Eval environment filtering (`eval/env.mjs`): `filterEnv` now drops an inherited `PI_WARDEN_TRACE_DIR`, so a `warden-offline` run cannot write its pi-warden trace into a folder inherited from the session that started the batch; only the cells that ask Jev get one, set by `scripts/eval-ab.mjs`.
+## 1.7.0
+
+### Added
+
+- `security.shareLinkParams` names the query parameters whose value is a share link rather than a credential, so a link the user reuses (a RED post's `xsec_token`) stays openable in the tool result instead of coming back as a dead `[redacted]` URL. Empty by default, user config only, and matched as a whole parameter name, with its case. A credential by construction is still masked inside a listed parameter, and a value that also appears outside the URL is masked everywhere. ([Configuration](docs/configuration.md#user-config))
+
+## 1.6.0
+
+### Added
+
+- The Token Guardian observer: for each valid `pi-subagents/supervision-evaluate/v1` event it makes one Jev request with five questions over allow-listed redacted metrics (the root ID is not sent), and records the answers and the answering model as one `subagent` trace entry. Nothing claims the event, steers, wakes, or holds. The new key `subagent.observer` defaults to `true` and needs Jev consent. ([Guards](docs/guards.md#token-guardian-observer))
+
+## 1.5.0
+
+### Added
+
+- The config panel has selectors for mode, judgment backend, widget placement and bar mode, conscience skill mode, and recall tool. Left/right wraps through supported values; Enter saves the chosen field and Esc cancels. Invalid values and custom backends remain intact until a choice is made, and other staged edits keep their existing `s` save behavior. ([Configuration](docs/configuration.md#user-config))
+
+## 1.4.0
+
+### Added
+
+- When the session runs in a [herdr](https://herdr.dev) pane, a warden confirm dialog now reports through herdr's `herdr:blocked` channel while it waits, so the pane's sidebar shows blocked instead of working. Interactive sessions only; no emission on hold-steers or headless runs. ([Guards](docs/guards.md#herdr-pane-state))
+
+## 1.3.1
+
+### Fixed
+
+- The commands that send their own prompt to the agent (`/warden init`, `/warden rules tune`, `/warden audit`, `/warden index`) no longer swallow it. Each set its busy flag before `sendUserMessage`, and the busy-flag guard on the `input` event saw the command's own prompt (which arrives with `source: "extension"`) and answered "handled", so no run ever started and the command reported the file (or report, or index) was never created — every time, deterministically. The guard now waits only for operator input (`interactive`/`rpc`); warden's own prompt passes and, like any user prompt, invalidates in-flight conscience assessments.
+- Those commands also no longer report before the run they injected ends. Pi's extension-facing `sendUserMessage` is fire-and-forget, so the `await ctx.waitForIdle()` that followed it could return before the injected run even flipped the session busy — the command reported while the agent was still working, or its status message was steered into the next run instead of recorded. Each command now waits in two phases: first for `before_agent_start` carrying the prompt it sent (30 seconds; on a miss — a preflight failure or another extension handling the input — it clears its flag and reports right away instead of blocking operator input), then for `agent_end` of that run with no cap (pi emits it on an abort too, so Esc still ends the wait), and finally for the host to go idle so the status message is recorded rather than steered.
+
+### Tests
+
+- A real-session e2e runs `/warden init` the way Pi does (the shipped entry in a real agent session with a scripted model): the injected prompt reaches the model, the agent's write call lands, and "pi-warden.md created" is recorded only after the run ended. Two unit tests pin the guard (extension input passes while a flag is set, operator input waits) and the wait (the command does not report before the run starts or ends). The session-test `write` stub now really writes, relative to the session directory, so the e2e can prove the file on disk.
+## 1.3.0
+
+### Added
+
+- The cause-check guard (on by default, `cause.enabled`): when the final reply of a run states a likely cause, or asks a person to check something the agent could inspect itself, and no tool result in that run checked it, pi-warden sends the reply back with one follow-up turn: check the cause with its own tools (a query, a log, a file, or a command) and give the evidence, or say plainly that the cause is unverified and why it cannot check it. It is the sibling of the done-check. An offline pre-filter (`causePreFilter`) fires on causal and hand-off wording, so a reply about results or next steps spends no request; the guard asks Jev whether the reply states a cause or hands off a check, whether the run checked it, and, when the project has an earlier unchecked cause inside the window, which earlier cause the reply repeats. The request carries the task, the final message, the last 40 of the run's tool calls, and up to five earlier redacted cause sentences with their keys and dates. Each unchecked cause is stored per project for `cause.windowDays` (default 7) as the redacted sentence that states it; a later reply whose cause Jev matches to an earlier one gets a stronger steer that names the earlier date, and a reply that hands a check to a person gets a steer that says so. When the done-check steers the same reply, the cause-check records its decision in the trace and sends no steer, so one reply gets at most one end-of-run steer. The repeat history lives in a `causes` table in the same owner-only database as the hold log, and every request, stored summary, and trace line passes through `redact()`.
+
+### Docs
+
+- `docs/guards.md` describes the new cause-check; `docs/configuration.md` lists its keys, widget template, and tokens; `docs/data-handling.md` and the consent notice name the cause-check request and its stored repeat history; `README.md` lists the guard next to the done-check.
+- `eval/reports/2026-10-07-cause-check/` measures the offline pre-filter on recorded sessions: the totals, the flagged count, and how many of a 20-reply sample were real unchecked causes.
+
+## 1.2.0
+
+### Added
+
+- The action guard reads a script a command runs from disk and applies the same pattern floor and ask gate to its body: `bash FILE`, `./FILE`, `source FILE` and `. FILE`, `npm`/`pnpm`/`yarn`/`bun` scripts from `package.json` (with `preNAME` and `postNAME`), `make TARGET` or the default target, and `node`/`python`/`python3`/`ruby`/`perl`/`deno run FILE`. A body is read only when it resolves, after symlinks, inside the project root or a temp root, as a regular file of at most 64 KB, and one level deep. A body hit keeps the id and severity it has when typed directly and its label names the source (`(via cleanup.sh)`, `(via npm run clean)`); `action.exemptRules` and user `commandRules` apply to it; a body hit makes the ask gate ask with `runs a script with <shape>`; and the body lines that hit ride the request to Jev as `script_lines`, redacted and bounded to five lines and 600 characters.
+
+- `/warden status` shows the build that runs: the pi-warden version, the checkout commit when the package is a git tree, the `dist/extension.js` build time, and the loaded pi-typesafe version. Session start warns once when a `src/` file is newer than the build (`pi-warden runs an old build: run npm run build`) and once when the loaded pi-typesafe version is outside the range in `package.json`.
+
+### Changed
+
+- The done-check nudge names one check command instead of "whatever exists": the last check that passed earlier in this session in this project, else the `check` then `test` script of the project's `package.json` run with the package manager its lock file names (`pnpm-lock.yaml`, `yarn.lock`, `bun.lockb` or `bun.lock`, else npm), else the same `Makefile` targets; with none of those it keeps the generic ask. The UI nudge names the last local URL a tool result printed this session (`http://localhost:PORT`, `127.0.0.1`, `[::1]`) when there is one.
+- Done-check UI proof now counts only what shows the page to the agent: a successful tool result that contains an image, a page text snapshot (`agent-browser snapshot`, `agent-browser get text`, the MCP `take_snapshot` tool), a browser or device test run (`playwright test`, `flutter test` with `integration_test` or golden tests), or a `read` of an image file. A screenshot command that only writes a file (`agent-browser screenshot PATH`, `idb screenshot`, `xcrun simctl io … screenshot`, `chrome --headless --screenshot`), `agent-browser` `open`/`close`/`click`/`fill`/`set`/`wait`/`eval`, and MCP navigation tools no longer count; a saved screenshot counts once something reads it. The `done.visualTools` defaults match, and every config key still works.
+- pi-typesafe `^0.9.1` (was `^0.9.0`).
+- `npm run check` builds before it tests, so the offline suite exercises a fresh `dist/` (the entry Pi ships) instead of a stale one.
+
+### Fixed
+
+- The done-check counts a shell command as a check only when a check runner starts one of its shell segments, after `cd DIR`, environment assignments, and `timeout`/`time`/`env`/`npx`/`pnpm exec`/`bunx`/`yarn`/`uv run`/`poetry run`/`python -m` wrappers (a wrapper is stripped only when what follows does not start a runner, so `yarn test` and `yarn run lint` are checks). A runner name in an argument (`grep -n jest package.json`, `which eslint`, `npm view vitest version`) no longer counts as a check.
+- A check run counts as proof only when it really ran and its output agrees: a failure summary is a failed check even with exit code 0, and a visible failure stays a failed check also with a passing summary; a summary that reports zero tests (`Tests: 0 total`, `[no tests to run]`, and similar) is never a check, unless a line of the output shows tests did run (cargo doc-tests after real results, a package a `go test` filter skipped); and when the shell can hide the exit code of any runner segment (a pipe right after its segment without `set -o pipefail`, or a `||`, `;`, or newline with more commands anywhere after it) the exit code is no proof — with no runner summary the run is not a check at all. Each run that names a runner but does not count gets one trace-only detail with the reason and no command; the reason names the word after the hiding separator only when it is a bare command name.
+- The done-check reads more runner summaries as proof: vitest, pytest without the `===` frame (`-q`), mypy, ruff (check, format, and `--fix`), black, prettier, biome, tsc pretty output, eslint, bun, mocha, playwright, flutter, deno, and cargo build, check and clippy; and the generic wrapper failure lines (`make: *** … Error N`, `npm error Lifecycle script … failed`, `npm ERR! code ELIFECYCLE`, pnpm and yarn `Command failed with exit code N`). The generic lines decide only when a runner starts the command, so a failed `npm install` is not a failed check. A failure marker anywhere in the tail wins over a passing one (black and ruff format `N files would be reformatted` beside `N files would be left unchanged.`, any go `FAIL` line, any cargo `test result: FAILED.` after an `ok`, pytest `2 passed, 1 error`, an indented or `pkg:test:`-prefixed vitest summary), a generic failure line overrides a passing summary in the same output, and the `Finished` line proves a `cargo build`, `cargo check` or `cargo clippy` segment only.
+- The done-check recognises more runner forms and reports: a runner started by a path (`.venv/bin/pytest`, `node_modules/.bin/tsc`), `python3.12 -m` and `.venv/bin/python -m` followed by a runner or `unittest`, wrappers with options (`timeout -s KILL 60`, `uv run --with httpx`, `npx -y`), package-manager options (`pnpm -C web test`, `npm --prefix web test`, `yarn workspace api test`), `make -C web test`, and `bash -c "npm test"`; the last exit code the agent printed with `echo`/`printf` (`$?`, or `${PIPESTATUS[0]}` after a pipe); a silent runner (`tsc`, `eslint`, `flake8`, `go vet`, `go build`) named in its own segment whose output is empty behind a pipe to `tail`, `head`, `tee`, or `cat`; and a hidden runner is covered only by its own printed exit code, its own silent pass, or a summary verdict. A command is first stripped of data text and a backslash-newline continuation is joined, so a runner word in a commit message or heredoc body is not a check. A bare `npm ci` or `bun ci` installs and does not count, a runner sent to the background with `&` does not count, and a visible failure stays a failed check when another runner's exit code is hidden.
+- With pi-typesafe 0.9.1 the usage ledger no longer loses counts when several Pi sessions run at once, so the reported spend and the daily caps count every session.
+
+### Tests
+
+- A new offline session test loads pi-warden the way Pi does (`package.json` → `pi.extensions` → `extensions/index.js` → `dist/extension.js`) into a real agent session with a scripted model, and asserts on the session's messages: a held destructive bash call, a done-check nudge after an unverified completion, and the repeat note after the same failing read twice. It fails with `run npm run build first` when the shipped entry is missing.
+
+### Docs
+
+- `docs/commands.md` describes the `/warden status` build line; `docs/ci-cd.md` states the new `npm run check` order (typecheck, build, offline tests).
+
+
+
+
+## 1.1.2
+
+### Fixed
+
+- The build removes `dist/` outputs whose `src/` source is gone. `tsc` never deletes an output whose source was removed, so stale files from other branches shipped with `1.1.1`: 17 files (`conscience-config`, `conscience-loader`, `conscience-policy`, `conscience-privacy`, `jev`, `laya-download`, `laya-judge`, `tool-recommendation`, each as `.js` and `.d.ts`, plus `extension.js.bak`) that nothing imports. Users need to do nothing.
+
+## 1.1.1
+
+### Fixed
+
+- `scripts/live-smoke.mjs` and `scripts/security-cases.mjs` no longer crash when a verdict has no off-task answer, which is now the usual case: the acting request does not ask `off_task`, only the trace sample does. The missing value prints as `-`.
+- The three off-task cases in `scripts/security-cases.mjs` (side comment, take over previous work, new instruction overrides history) pass `traceSample: 1`, so every call asks the off-task question and the cases test its answer again.
+
 ## 1.1.0
 
 ### Added

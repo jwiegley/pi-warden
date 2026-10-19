@@ -3,20 +3,21 @@ import type { Stats } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { ask, choice, noul, score } from "pi-typesafe";
+import { ask, choice, chunkEvaluationRequest, noul, score } from "pi-typesafe";
 import type { IntegrationErrorCode, Judge, Questions } from "pi-typesafe";
 import type { ActionGuardConfig, ArmingRule, CommandRule, LargeOutputConfig, PathRule, RulesConfig, SecurityConfig, SlopGuardConfig } from "./config.js";
 import { redact } from "./redact.js";
 import { SPINE_GOAL_LIMIT, SPINE_HISTORY_LIMIT, SPINE_HISTORY_TURNS } from "./shape.js";
 import type { TaskSpine } from "./shape.js";
-import { globToRegExp } from "./rules.js";
-import type { RulesSourceConfig } from "./rules.js";
+import { askChunks, globToRegExp, questionLimit } from "./rules.js";
+import type { LimitedJudge, RulesSourceConfig } from "./rules.js";
 import { indexDir } from "./index-cmd.js";
 import type { HostDirs } from "./host-dirs.js";
 import { resolveRulesFile } from "./rules-file.js";
 import { mergeWrites, shellWrites } from "./shell-writes.js";
 import { COMMAND_TOOLS, commandOf } from "./tools.js";
 import { actionAskGate } from "./ask-gate.js";
+import { scriptSources, shellParts, type ScriptSource } from "./script-bodies.js";
 import { actionTokens, DEFAULT_TEMPLATES, renderTemplate } from "./widget.js";
 
 export type Level = "allow" | "warn" | "confirm" | "deny";
@@ -79,6 +80,10 @@ export interface PatternHit {
   action?: "dialog" | "hold";
   /** Optional user-defined message, shown instead of the derived label. */
   message?: string;
+  /** Set when the hit comes from a script body the command runs; names the source (`cleanup.sh`, `npm run clean`). */
+  via?: string;
+  /** Body lines that produced this hit, for the request's `script_lines` field. */
+  lines?: string[];
 }
 
 export interface ActionInput {
@@ -220,7 +225,7 @@ export type { Judge } from "pi-typesafe";
 export interface EvaluateOptions {
   config: ActionGuardConfig;
   /** Omit to run offline pattern checks only (no consent, no network). */
-  judge?: Judge | undefined;
+  judge?: LimitedJudge | undefined;
   signal?: AbortSignal | undefined;
   /** Adds quality questions for write/edit content to the same request. */
   slop?: SlopGuardConfig | undefined;
@@ -350,7 +355,6 @@ const GIT_MESSAGE_SUBCOMMANDS = new Set(["commit", "tag", "notes", "merge", "sta
 /** Interpreters whose stdin script can still run shell commands; their heredoc bodies stay in scope when they do. */
 const INTERPRETERS = /^(?:python[\d.]*|node|ruby|perl|php|deno|bun|tsx|Rscript|lua[\d.]*)$/;
 const EXEC_CALLS = /\b(?:os\.system|os\.popen|os\.exec\w*|subprocess|child_process|execSync|spawnSync|execFileSync|spawn\(|exec\(|system\(|popen\(|shell_exec|passthru|proc_open|Open3|IO\.popen|Deno\.run|Deno\.Command|Bun\.spawn|Bun\.\$|%x[\[{(]|`[^`\n]*\b(?:rm|git|dd|mkfs|kubectl|terraform)\b)/;
-const HEREDOC = /<<-?\s*(?:"(\w+)"|'(\w+)'|(\\)?(\w+))/;
 const SUBSTITUTION = /\$\(|`/;
 
 function headOf(segment: string): string | undefined {
@@ -528,31 +532,28 @@ export interface ScannedCommand {
  * (`python3 - <<EOF`) are kept when the script calls out to a shell or process API.
  */
 export function stripDataText(command: string): ScannedCommand {
-  const lines = command.split("\n");
-  const out: string[] = [];
   let stripped = false;
-  for (let index = 0; index < lines.length; index++) {
-    const line = lines[index]!;
-    const heredoc = HEREDOC.exec(line);
-    if (!heredoc) { out.push(line); continue; }
-    const delimiter = heredoc[1] ?? heredoc[2] ?? heredoc[4]!;
-    // 'EOF', "EOF", and \EOF make the body literal; a bare EOF body is expanded, so a substitution inside it runs.
-    const literal = heredoc[4] === undefined || heredoc[3] !== undefined;
-    const body: string[] = [];
-    let close = index + 1;
-    while (close < lines.length && lines[close]!.replace(/^\t+/, "") !== delimiter) body.push(lines[close]!), close++;
-    const bodyText = body.join("\n");
+  // Only a `<<` the shell scan reads as one starts a body: not a here-string `<<<`, nor `<<` in quotes or a comment. A
+  // command the scan cannot read keeps every line in scope.
+  const heredocs = scanShell(command)?.heredocs ?? [];
+  let scanned = "";
+  let cursor = 0;
+  for (const heredoc of heredocs) {
+    const line = command.slice(heredoc.line, heredoc.start - 1);
+    const body = command.slice(heredoc.start, heredoc.end);
+    const bodyText = body.replace(/\n$/, "");
     // The whole pipeline on the heredoc line counts: `cat <<EOF | bash` executes the body as much as `bash <<EOF` does.
     const heads = splitShell(line).map(segment => headOf(segment) ?? "");
-    const consumer = headOf(line.slice(0, heredoc.index)) ?? "";
-    const executed = heads.some(head => SHELL_SINKS.has(head)) || (INTERPRETERS.test(consumer) && EXEC_CALLS.test(bodyText)) || (!literal && SUBSTITUTION.test(bodyText));
-    out.push(line);
-    if (executed) out.push(...body);
-    else if (body.length) { out.push(`[heredoc body: ${body.length} lines of data]`); stripped = true; }
-    if (close < lines.length) out.push(lines[close]!);
-    index = close;
+    const consumer = headOf(line.slice(0, heredoc.operator - heredoc.line)) ?? "";
+    // 'EOF', "EOF", E"O"F, and \EOF make the body literal; a bare EOF body is expanded, so a substitution inside it runs.
+    const executed = heads.some(head => SHELL_SINKS.has(head)) || (INTERPRETERS.test(consumer) && EXEC_CALLS.test(bodyText)) || (!heredoc.literal && SUBSTITUTION.test(bodyText));
+    scanned += command.slice(cursor, heredoc.start);
+    cursor = heredoc.end;
+    if (executed || !body) { scanned += body; continue; }
+    scanned += `[heredoc body: ${bodyText.split("\n").length} lines of data]${body.endsWith("\n") ? "\n" : ""}`;
+    stripped = true;
   }
-  const scanned = out.join("\n");
+  scanned += command.slice(cursor);
   const joined = blankMessageFlags(scanned);
   const segments = splitShell(joined);
   // A shell sink anywhere may run text written earlier in the same command (`cat <<EOF > run.sh` then `bash run.sh`), so nothing is treated as data.
@@ -560,7 +561,12 @@ export function stripDataText(command: string): ScannedCommand {
   if (/\b(?:ba|z|da|k)?sh\s+-[a-zA-Z]*c\b/.test(joined)) return { text: command, stripped: false };
   let text = joined;
   if (joined !== scanned) stripped = true;
-  for (const segment of segments) {
+  // A printed or searched message is cut where the shell cuts, so `echo "a; b"` stays one argument. git and gh keep the
+  // wider cut: `blankMessageFlags` already blanked the flags that take a message, and `gh pr view --body` takes none.
+  const parts = shellParts(joined);
+  const printsData = (segment: string) => DATA_HEADS.has(headOf(segment) ?? "");
+  const dataSegments = parts === undefined ? segments : [...parts.filter(printsData), ...segments.filter(segment => !printsData(segment))];
+  for (const segment of dataSegments) {
     if (!isDataSegment(segment) || !/["']/.test(segment)) continue;
     const blanked = blankQuotes(segment);
     if (blanked === segment) continue;
@@ -568,6 +574,180 @@ export function stripDataText(command: string): ScannedCommand {
     stripped = true;
   }
   return { text, stripped };
+}
+
+// A shell comment can carry text the agent wrote to sway Jev, or delete text that never runs; Jev and the floor read only
+// what the shell runs.
+/**
+ * The command text Jev and the pattern floor read: shell comments removed, and each backslash-newline the shell removes
+ * joined (outside quotes, in double quotes and `${…}`, and in a heredoc body with an unquoted delimiter); quotes,
+ * escapes, heredoc bodies, `$#`, `${#…}`, and a `#` mid-word kept. Quote state carries across lines. A construct the
+ * scan does not model (backticks, arithmetic, `case` inside `$(…)`, quotes inside `${…}`), or an unclosed quote,
+ * returns the command unchanged.
+ */
+export function stripShellComments(command: string): string {
+  return scanShell(command)?.text ?? command;
+}
+
+/** A heredoc the shell scan found, by offsets into the scanned command: the line that holds the `<<`, the `<<`, and the
+ * body before its delimiter line. */
+interface Heredoc { line: number; operator: number; start: number; end: number; literal: boolean }
+
+/** Whether a line ends in a backslash that escapes the new line after it, not one that a backslash before it escapes. */
+function continues(line: string): boolean {
+  let count = 0;
+  while (count < line.length && line[line.length - 1 - count] === "\\") count++;
+  return count % 2 === 1;
+}
+
+/** `stripShellComments` with the heredocs it read; undefined where it returns the command unchanged. */
+function scanShell(command: string): { text: string; heredocs: Heredoc[] } | undefined {
+  type Context = "single" | "double" | "ansi" | "brace" | "subshell";
+  const stack: Context[] = [];
+  const depths: number[] = [];
+  const heredocs: Array<{ delimiter: string; tabs: boolean; literal: boolean; line: number; operator: number }> = [];
+  const found: Heredoc[] = [];
+  let out = "";
+  // Text before this length is not trailing blank space, so a removed comment takes only the blanks before it.
+  let kept = 0;
+  let wordStart = true;
+  let index = 0;
+  // Where the current logical line starts: a backslash-newline continues it.
+  let lineStart = 0;
+  const emit = (text: string, blank = false) => { out += text; if (!blank) kept = out.length; };
+  // The offset of the next character bash reads at `at`: a backslash-newline before it is gone, so `<\<nl><` is `<<`.
+  const after = (at: number): number => { while (command.startsWith("\\\n", at)) at += 2; return at; };
+  // A heredoc delimiter word, quotes and backslashes removed; undefined when it is not a plain word.
+  const delimiterWord = (): { word: string; literal: boolean } | undefined => {
+    let word = "";
+    let raw = "";
+    for (index = after(index); index < command.length && /[ \t]/.test(command[index]!); index = after(index + 1)) raw += command[index];
+    while (index < command.length && !/[\s;|&<>()]/.test(command[index]!)) {
+      const char = command[index]!;
+      if (char === "'" || char === "\"") {
+        const close = command.indexOf(char, index + 1);
+        if (close < 0 || command.slice(index + 1, close).includes("\n")) return undefined;
+        word += command.slice(index + 1, close);
+        raw += command.slice(index, close + 1);
+        index = close + 1;
+        continue;
+      }
+      if (char === "\\" && command[index + 1] === "\n") { index += 2; continue; }
+      if (char === "\\") { if (index + 1 >= command.length) return undefined; word += command[index + 1]; raw += command.slice(index, index + 2); index += 2; continue; }
+      if (char === "$" || char === "`") return undefined;
+      word += char; raw += char; index++;
+    }
+    if (!word) return undefined;
+    emit(raw);
+    return { word, literal: /['"\\]/.test(raw) };
+  };
+  while (index < command.length) {
+    const char = command[index]!;
+    const context = stack.at(-1);
+    if (context === "single") { emit(char); index++; if (char === "'") stack.pop(); continue; }
+    if (context === "ansi" || context === "double" || context === "brace") {
+      if (char === "\\") {
+        // bash keeps a backslash-newline inside `$'…'` (measured, bash 3.2) and removes it in `"…"` and `${…}`.
+        if (command[index + 1] !== "\n" || context === "ansi") emit(command.slice(index, index + 2));
+        index += 2;
+        continue;
+      }
+      if (context === "ansi") { emit(char); index++; if (char === "'") stack.pop(); continue; }
+      if (char === "`") return undefined;
+      if (context === "brace") {
+        if (char === "'" || char === "\"" || char === "$") return undefined;
+        emit(char); index++;
+        if (char === "}") stack.pop();
+        continue;
+      }
+      if (char === "\"") { emit(char); index++; stack.pop(); continue; }
+      const next = char === "$" ? after(index + 1) : index;
+      if (char === "$" && command[next] === "(") {
+        if (command[after(next + 1)] === "(") return undefined;
+        emit("$("); index = next + 1; stack.push("subshell"); depths.push(0); wordStart = true; continue;
+      }
+      if (char === "$" && command[next] === "{") { emit("${"); index = next + 1; stack.push("brace"); continue; }
+      if (char === "$" && command[next] === "[") return undefined;
+      emit(char); index++;
+      continue;
+    }
+    // Unquoted: the top level or inside `$(…)`.
+    if (char === "\\") {
+      // A backslash-newline is gone before bash reads words: `r\<nl>m` runs `rm`, and `true &&\<nl>sh a.sh` runs `sh`.
+      if (command[index + 1] !== "\n") { emit(command.slice(index, index + 2)); wordStart = false; }
+      index += 2;
+      continue;
+    }
+    if (char === "#" && wordStart) {
+      while (index < command.length && command[index] !== "\n") index++;
+      out = out.slice(0, kept);
+      continue;
+    }
+    if (char === "\n") {
+      emit(char); index++; wordStart = true;
+      for (const { delimiter, tabs, literal, line: operatorLine, operator } of heredocs.splice(0)) {
+        const start = index;
+        let end = command.length;
+        while (index < command.length) {
+          const bodyLine = index;
+          let line = "";
+          let lineEnd: number;
+          // An unquoted body joins a backslash-newline before bash matches the delimiter (measured, bash 3.2): `EO\<nl>F` ends it.
+          for (;;) {
+            lineEnd = command.indexOf("\n", index);
+            const piece = command.slice(index, lineEnd < 0 ? command.length : lineEnd);
+            index = lineEnd < 0 ? command.length : lineEnd + 1;
+            if (literal || lineEnd < 0 || !continues(piece)) { line += piece; break; }
+            line += piece.slice(0, -1);
+          }
+          emit(lineEnd < 0 ? line : `${line}\n`);
+          if ((tabs ? line.replace(/^\t+/, "") : line) === delimiter) { end = bodyLine; break; }
+        }
+        found.push({ line: operatorLine, operator, start, end, literal });
+      }
+      lineStart = index;
+      continue;
+    }
+    if (char === " " || char === "\t") { emit(char, true); index++; wordStart = true; continue; }
+    if (char === "`") return undefined;
+    if (char === "'") { emit(char); index++; stack.push("single"); wordStart = false; continue; }
+    if (char === "\"") { emit(char); index++; stack.push("double"); wordStart = false; continue; }
+    if (char === "$") {
+      const at = after(index + 1);
+      const next = command[at];
+      if (next === "'") { emit("$'"); index = at + 1; stack.push("ansi"); wordStart = false; continue; }
+      if (next === "\"") { emit("$\""); index = at + 1; stack.push("double"); wordStart = false; continue; }
+      if (next === "(" && command[after(at + 1)] === "(") return undefined;
+      if (next === "(") { emit("$("); index = at + 1; stack.push("subshell"); depths.push(0); wordStart = true; continue; }
+      if (next === "{") { emit("${"); index = at + 1; stack.push("brace"); wordStart = false; continue; }
+      if (next === "[") return undefined;
+      emit(char); index++; wordStart = false;
+      continue;
+    }
+    if (char === "(" && command[after(index + 1)] === "(") return undefined;
+    if (char === "<" && command[after(index + 1)] === "<") {
+      const third = after(after(index + 1) + 1);
+      if (command[third] === "<") { emit("<<<"); index = third + 1; wordStart = true; continue; }
+      const tabs = command[third] === "-";
+      const operator = index;
+      emit(tabs ? "<<-" : "<<"); index = tabs ? third + 1 : third;
+      const delimiter = delimiterWord();
+      if (delimiter === undefined) return undefined;
+      heredocs.push({ delimiter: delimiter.word, tabs, literal: delimiter.literal, line: lineStart, operator });
+      wordStart = false;
+      continue;
+    }
+    if (context === "subshell") {
+      if (wordStart && /^case\b/.test(command.slice(index))) return undefined;
+      if (char === "(") depths[depths.length - 1]!++;
+      if (char === ")" && depths.at(-1) === 0) { emit(char); index++; stack.pop(); depths.pop(); wordStart = false; continue; }
+      if (char === ")") depths[depths.length - 1]!--;
+    }
+    emit(char); index++;
+    wordStart = /[;|&()<>]/.test(char);
+  }
+  if (stack.length || heredocs.length) return undefined;
+  return { text: out, heredocs: found };
 }
 
 // ---------------------------------------------------------------------------
@@ -1837,6 +2017,8 @@ export interface PatternOptions {
   commandDenyRules?: readonly CommandRule[];
   exemptRules?: readonly string[];
   pathRules?: readonly PathRule[];
+  /** Script bodies already read for this command, so the floor and the ask gate do not read them twice. */
+  scripts?: readonly ScriptSource[] | undefined;
   /** Real paths the agent created under the temp directory in this session; a recursive rm of only these is not destructive. */
   scratch?: ScratchRecords | undefined;
   /** Scratch roots the host declared for this session; a recursive rm of a path strictly inside one is risky. */
@@ -1904,56 +2086,111 @@ function compileUserRule(raw: CommandRule, defaultSeverity: Severity): CompiledU
   }
 }
 
-export function matchPatterns(tool: string, input: Record<string, unknown>, cwd?: string, options?: PatternOptions): PatternHit[] {
+/** The built-in shell rules and user command rules for one command body. `raw` is the text without shell comments
+ * (`stripShellComments`); `stripDataText` blanks the data that is not a command. Deduplicated by id. */
+function commandPatternHits(raw: string, cwd: string | undefined, options: PatternOptions | undefined, exempt: ReadonlySet<string>): PatternHit[] {
   const hits = new Map<string, PatternHit>();
   const add = (hit: PatternHit | undefined) => { if (hit && !hits.has(hit.id)) hits.set(hit.id, hit); };
-  const raw = commandOf(tool, input)?.command;
+  const command = stripDataText(raw).text;
+  for (const rule of SHELL_RULES) if (!exempt.has(rule.id) && rule.test.test(command)) add({ id: rule.id, severity: rule.severity, label: rule.label });
+  applySqlTargets(raw, hits, exempt);
+  applyGitState(raw, hits, cwd);
+  // A command that raises privileges anywhere (`sudo`, `doas`, `su -c`, a heredoc fed to `sudo bash`) deletes as someone else,
+  // and one that moves, links, copies, or extracts data can fill a path after the birth-time walk: no recorded scratch.
+  const privileged = PRIVILEGED.test(command);
+  const movesIn = MOVES_IN.test(unquoted(raw)) || MOVES_IN.test(unquoted(command));
+  const scratch = privileged || movesIn || !scratchPlatform(options?.platform) ? undefined : options?.scratch;
+  const segments = splitShell(command);
+  // A command that mounts, attaches, binds, or syncs data in with its source removed can put existing data under a
+  // path a later `rm` deletes, and the birth-time walk cannot see it: no release rule applies at all then.
+  const blocked = privileged || MOVES_DATA_IN.test(unquoted(command)) || MOVES_DATA_IN.test(unquoted(raw));
+  // Read the cheap volatile temp roots only when a recursive rm needs them; the macOS /var/folders walk is lazier.
+  let volatile: string[] | undefined;
+  const volatileRoots = () => (volatile ??= disposableTempRoots());
+  const scratchVars = blocked || unreadVariableSink(command) ? undefined : commandVars(segments, volatileRoots, variableWrites(command));
+  const scratchRoots = blocked ? undefined : options?.scratchPaths;
+  // `mv` and `ln` in the same command put data under their destination; a target that relates to one keeps the hold.
+  // A mover word the per-segment parse cannot read (`bash -c 'mv a b'`, `xargs ln -s a b`) keeps every hold as well.
+  const { dirs, changed } = effectiveDirs(segments, cwd, scratchVars);
+  const moved = blocked ? [] : segments.map((segment, index) => moverDestination(segment, dirs[index] ?? cwdPath(cwd), scratchVars?.[index])).filter((mover): mover is Mover => mover !== undefined);
+  const unread = blocked ? false : unreadMover(segments);
+  for (let index = 0; index < segments.length; index++) {
+    const hit = classifyRm(segments[index]!, cwd, scratch, blocked ? undefined : { vars: scratchVars?.[index], roots: scratchRoots, tempRoots: volatileRoots, moved, unreadMover: unread, recorded: options?.movedIn, dir: dirs[index], dirChanged: changed[index] });
+    // classifyRm derives ids (rm-recursive, rm-rf, rm-recursive-dangerous-target); they are exemptable like any built-in.
+    if (hit && !exempt.has(hit.id)) add(hit);
+  }
+  if (!exempt.has("sensitive-path") && SENSITIVE_PATH.test(command)) add({ id: "sensitive-path", severity: "sensitive", label: "touches a secrets or credentials file" });
+  for (const rule of options?.commandDenyRules ?? []) {
+    if (exempt.has(rule.id)) continue;
+    const compiled = compileUserRule(rule, "deny");
+    if (compiled && compiled.test.test(command)) add({ id: compiled.id, severity: "deny", label: compiled.message ?? compiled.label });
+  }
+  for (const rule of options?.commandRules ?? []) {
+    if (exempt.has(rule.id)) continue;
+    const severity: Severity = rule.severity === "deny" ? "deny" : rule.severity === "confirm" ? "destructive" : "risky";
+    const compiled = compileUserRule(rule, severity);
+    if (compiled && compiled.test.test(command)) add({ id: compiled.id, severity, label: compiled.message ?? compiled.label, ...(rule.action ? { action: rule.action } as { action: string } : {}) } as PatternHit & { action?: string });
+  }
+  return [...hits.values()];
+}
+
+/** A shell deletion line, for the body lines a `script_lines` field reports. */
+const RM_LINE = /(?:^|[\s"'(`])rm\s|find\b[^\n]*(?:-delete\b|-exec\w*\s+rm\b)/;
+
+/** The body lines that match a rule, for the `script_lines` field of the request; the caller caps the count and length. */
+function matchingLines(body: string, options: PatternOptions | undefined, exempt: ReadonlySet<string>): string[] {
+  const userRules = [...(options?.commandDenyRules ?? []), ...(options?.commandRules ?? [])]
+    .filter(rule => !exempt.has(rule.id))
+    .map(rule => compileUserRule(rule, rule.severity === "deny" ? "deny" : "risky"))
+    .filter((rule): rule is NonNullable<ReturnType<typeof compileUserRule>> => rule !== undefined);
+  const lines: string[] = [];
+  for (const line of body.split("\n")) {
+    const text = line.trim();
+    if (!text) continue;
+    const matched = SHELL_RULES.some(rule => !exempt.has(rule.id) && rule.test.test(text))
+      || RM_LINE.test(text)
+      || (!exempt.has("sensitive-path") && SENSITIVE_PATH.test(text))
+      || userRules.some(rule => rule.test.test(text));
+    if (!matched) continue;
+    lines.push(text);
+    if (lines.length >= 10) break;
+  }
+  return lines;
+}
+
+export function matchPatterns(tool: string, input: Record<string, unknown>, cwd?: string, options?: PatternOptions): PatternHit[] {
+  const hits = new Map<string, PatternHit>();
   const exempt = new Set(options?.exemptRules ?? []);
+  // A body hit keeps its own entry even when the outer command has the same id: the label names the script, and the
+  // request needs its `lines`. Direct hits keep the id dedupe they always had.
+  const merge = (list: readonly PatternHit[], via?: string) => {
+    for (const hit of list) {
+      const key = via === undefined ? hit.id : `${hit.id}\u0000${via}`;
+      if (hits.has(key)) continue;
+      hits.set(key, via === undefined ? hit : { ...hit, via, label: `${hit.label} (via ${via})`, ...(hit.message !== undefined ? { message: `${hit.message} (via ${via})` } : {}) });
+    }
+  };
+  const view = commandOf(tool, input);
+  const raw = view?.command;
   if (raw) {
-    const command = stripDataText(raw).text;
-    for (const rule of SHELL_RULES) if (!exempt.has(rule.id) && rule.test.test(command)) add({ id: rule.id, severity: rule.severity, label: rule.label });
-    applySqlTargets(raw, hits, exempt);
-    applyGitState(raw, hits, cwd);
-    // A command that raises privileges anywhere (`sudo`, `doas`, `su -c`, a heredoc fed to `sudo bash`) deletes as someone else,
-    // and one that moves, links, copies, or extracts data can fill a path after the birth-time walk: no recorded scratch.
-    const privileged = PRIVILEGED.test(command);
-    const movesIn = MOVES_IN.test(unquoted(raw)) || MOVES_IN.test(unquoted(command));
-    const scratch = privileged || movesIn || !scratchPlatform(options?.platform) ? undefined : options?.scratch;
-    const segments = splitShell(command);
-    // A command that mounts, attaches, binds, or syncs data in with its source removed can put existing data under a
-    // path a later `rm` deletes, and the birth-time walk cannot see it: no release rule applies at all then.
-    const blocked = privileged || MOVES_DATA_IN.test(unquoted(command)) || MOVES_DATA_IN.test(unquoted(raw));
-    // Read the cheap volatile temp roots only when a recursive rm needs them; the macOS /var/folders walk is lazier.
-    let volatile: string[] | undefined;
-    const volatileRoots = () => (volatile ??= disposableTempRoots());
-    const scratchVars = blocked || unreadVariableSink(command) ? undefined : commandVars(segments, volatileRoots, variableWrites(command));
-    const scratchRoots = blocked ? undefined : options?.scratchPaths;
-    // `mv` and `ln` in the same command put data under their destination; a target that relates to one keeps the hold.
-    // A mover word the per-segment parse cannot read (`bash -c 'mv a b'`, `xargs ln -s a b`) keeps every hold as well.
-    const { dirs, changed } = effectiveDirs(segments, cwd, scratchVars);
-    const moved = blocked ? [] : segments.map((segment, index) => moverDestination(segment, dirs[index] ?? cwdPath(cwd), scratchVars?.[index])).filter((mover): mover is Mover => mover !== undefined);
-    const unread = blocked ? false : unreadMover(segments);
-    for (let index = 0; index < segments.length; index++) {
-      const hit = classifyRm(segments[index]!, cwd, scratch, blocked ? undefined : { vars: scratchVars?.[index], roots: scratchRoots, tempRoots: volatileRoots, moved, unreadMover: unread, recorded: options?.movedIn, dir: dirs[index], dirChanged: changed[index] });
-      // classifyRm derives ids (rm-recursive, rm-rf, rm-recursive-dangerous-target); they are exemptable like any built-in.
-      if (hit && !exempt.has(hit.id)) add(hit);
-    }
-    if (!exempt.has("sensitive-path") && SENSITIVE_PATH.test(command)) add({ id: "sensitive-path", severity: "sensitive", label: "touches a secrets or credentials file" });
-    for (const raw of options?.commandDenyRules ?? []) {
-      if (exempt.has(raw.id)) continue;
-      const compiled = compileUserRule(raw, "deny");
-      if (compiled && compiled.test.test(command)) add({ id: compiled.id, severity: "deny", label: compiled.message ?? compiled.label });
-    }
-    for (const raw of options?.commandRules ?? []) {
-      if (exempt.has(raw.id)) continue;
-      const severity: Severity = raw.severity === "deny" ? "deny" : raw.severity === "confirm" ? "destructive" : "risky";
-      const compiled = compileUserRule(raw, severity);
-      if (compiled && compiled.test.test(command)) add({ id: compiled.id, severity, label: compiled.message ?? compiled.label, ...(raw.action ? { action: raw.action } as { action: string } : {}) } as PatternHit & { action?: string });
+    const code = stripShellComments(raw);
+    merge(commandPatternHits(code, cwd, options, exempt));
+    // The bodies of scripts the command runs are read one level deep: a script the body calls is not read again.
+    if (view?.shell) {
+      const sources = options?.scripts ?? scriptSources(stripDataText(code).text, cwd);
+      for (const source of sources) {
+        if (source.kind !== "shell") continue;
+        const body = stripShellComments(source.body);
+        const bodyHits = commandPatternHits(body, cwd, options, exempt);
+        if (!bodyHits.length) continue;
+        const lines = matchingLines(body, options, exempt);
+        merge(bodyHits.map(hit => ({ ...hit, lines })), source.source);
+      }
     }
   }
   const path = typeof input.path === "string" ? input.path : undefined;
-  if (path && SENSITIVE_PATH.test(path)) add({ id: "sensitive-path", severity: "sensitive", label: "touches a secrets or credentials file" });
-  for (const hit of matchPathRules(tool, input, cwd, options?.pathRules, exempt)) add(hit);
+  if (path && SENSITIVE_PATH.test(path) && !hits.has("sensitive-path")) hits.set("sensitive-path", { id: "sensitive-path", severity: "sensitive", label: "touches a secrets or credentials file" });
+  for (const hit of matchPathRules(tool, input, cwd, options?.pathRules, exempt)) if (!hits.has(hit.id)) hits.set(hit.id, hit);
   return [...hits.values()];
 }
 
@@ -2096,7 +2333,7 @@ export function matchPathRules(tool: string, input: Record<string, unknown>, cwd
   };
   const raw = commandOf(tool, input)?.command;
   if (raw) {
-    const text = stripDataText(raw).text;
+    const text = stripDataText(stripShellComments(raw)).text;
     const sinks = writeSinkTargets(text);
     const mentioned = (rule: PathRule) => mentionRegex(rule).some(re => re.test(text));
     const sinkWrite = (rule: PathRule) => sinks.some(target => pathRuleMatches(rule, target));
@@ -2634,7 +2871,26 @@ export function describePlan(plan: string | undefined): string | undefined {
   return text ? truncate(redact(text), PLAN_LIMIT) : undefined;
 }
 
-export function buildRequest(summary: ActionSummary, task: string | undefined, extras: { slop?: boolean; approval?: boolean; security?: boolean; context?: readonly TaskMessage[] | undefined; previousActions?: readonly PreviousAction[] | undefined; plan?: string | undefined; questions?: Questions | undefined; rules?: string | undefined; rulesSource?: string | undefined; violations?: readonly Violation[] | undefined; floorHits?: string; spine?: TaskSpine | undefined; largeOutput?: boolean; shouldProceed?: boolean; traceOnly?: boolean } = {}) {
+const SCRIPT_LINES_LIMIT = 5;
+const SCRIPT_LINES_CHARS = 600;
+
+/** The body lines that hit, each redacted, deduplicated, and bounded to five lines and 600 characters. */
+function capScriptLines(lines: readonly string[]): string | undefined {
+  const seen = new Set<string>();
+  const kept: string[] = [];
+  for (const line of lines) {
+    const text = redact(line).trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    kept.push(text);
+    if (kept.length >= SCRIPT_LINES_LIMIT) break;
+  }
+  if (!kept.length) return undefined;
+  const joined = kept.join("\n");
+  return joined.length <= SCRIPT_LINES_CHARS ? joined : joined.slice(0, SCRIPT_LINES_CHARS);
+}
+
+export function buildRequest(summary: ActionSummary, task: string | undefined, extras: { slop?: boolean; approval?: boolean; security?: boolean; context?: readonly TaskMessage[] | undefined; previousActions?: readonly PreviousAction[] | undefined; plan?: string | undefined; questions?: Questions | undefined; rules?: string | undefined; rulesSource?: string | undefined; violations?: readonly Violation[] | undefined; floorHits?: string; scriptLines?: string | undefined; spine?: TaskSpine | undefined; largeOutput?: boolean; shouldProceed?: boolean; traceOnly?: boolean } = {}) {
   const writesContent = (summary.tool === "write" || summary.tool === "edit" || summary.writes !== undefined) && hasContent(summary);
   const wantSlop = extras.slop && writesContent;
   const previous = (extras.previousActions ?? []).slice(-PREVIOUS_ACTIONS_LIMIT).map(action => ({ ...action, ...(action.command !== undefined ? { command: truncate(action.command, PREVIOUS_COMMAND_LIMIT) } : {}) }));
@@ -2645,10 +2901,12 @@ export function buildRequest(summary: ActionSummary, task: string | undefined, e
   // off-task/scope questions, which are trace-only and ride the sampled `traceOnly` request instead. The should-proceed
   // question rides it too, unless `shouldProceed` opts the acting request in to the steer that reads it.
   const baseQuestions = { irreversible: questions.irreversible, mutates: questions.mutates };
+  // Jev must not read shell comments: the agent can write persuasive text into one to sway the judgment.
+  const jevAction = summary.command === undefined ? summary : { ...summary, command: stripShellComments(summary.command) };
   return {
     state: {
       task: task?.trim() ? truncate(redact(task.trim()), TASK_LIMIT) : "(no user request recorded in this session)",
-      action: summary as unknown as Record<string, string | number | boolean>,
+      action: jevAction as unknown as Record<string, string | number | boolean>,
       // Clipped per message already; `recentTaskContext` bounds the count.
       context: traceOnly ? (extras.context ?? []).slice(-8).map(message => ({ role: message.role, text: truncate(redact(message.text), 750) })) : [],
       // The spine's `task` is deliberately not repeated here: state.task above already carries it, unchanged for approval.
@@ -2661,6 +2919,7 @@ export function buildRequest(summary: ActionSummary, task: string | undefined, e
       ...(previous.length ? { previous_actions: previous } : {}),
       ...(extras.rules ? { rules: extras.rules, ...(extras.rulesSource ? { rulesSource: extras.rulesSource } : {}) } : {}),
       ...(extras.floorHits ? { floor_hits: extras.floorHits } : {}),
+      ...(extras.scriptLines ? { script_lines: extras.scriptLines } : {}),
 
     },
     questions: traceOnly
@@ -2707,7 +2966,22 @@ async function judgeAction(action: ActionInput, options: EvaluateOptions): Promi
   }
   const plan = describePlan(action.plan);
   const withPlan = (verdict: Verdict): Verdict => (plan ? { ...verdict, plan } : verdict);
-  const patterns = matchPatterns(action.tool, action.input, action.cwd, { commandRules: config.commandRules, commandDenyRules: config.commandDenyRules, exemptRules: config.exemptRules, pathRules: config.pathRules, scratch: options.scratch, scratchPaths: options.scratchPaths, movedIn: options.movedIn });
+  const view = commandOf(action.tool, action.input);
+  // Read the script bodies once: the floor labels their hits and the ask gate reads their shapes from the same list.
+  // The text the shell runs, as the floor reads it: comments removed and backslash-newlines joined, then data blanked.
+  const shellText = view?.shell ? stripDataText(stripShellComments(view.command)).text : undefined;
+  const scriptBodies = shellText === undefined ? [] : scriptSources(shellText, action.cwd);
+  const patterns = matchPatterns(action.tool, action.input, action.cwd, { commandRules: config.commandRules, commandDenyRules: config.commandDenyRules, exemptRules: config.exemptRules, pathRules: config.pathRules, scripts: scriptBodies, scratch: options.scratch, scratchPaths: options.scratchPaths, movedIn: options.movedIn });
+  // A script body the command runs that hit the floor: its lines ride the request, and the call is worth a judge even
+  // when the gate would have left the outer command offline.
+  // Lines of the whole body with its comments stripped, as the floor reads them, so a multi-line string keeps its quote
+  // state and a code line that starts with `#` inside it stays.
+  const hitSources = new Set(patterns.flatMap(hit => hit.via ?? []));
+  const lineOptions = { commandRules: config.commandRules, commandDenyRules: config.commandDenyRules };
+  const scriptLines = capScriptLines(scriptBodies
+    .filter(source => source.kind === "shell" && hitSources.has(source.source))
+    .flatMap(source => matchingLines(stripShellComments(source.body), lineOptions, new Set(config.exemptRules ?? []))));
+  const bodyHit = patterns.some(hit => hit.via !== undefined);
   // Violation pipeline: authorize per-violation, remove authorized from level computation and Jev questions.
   const violationsByHit = hitViolations(patterns, action.tool, action.input);
   const allViolations = violationsByHit.flat();
@@ -2780,7 +3054,6 @@ async function judgeAction(action: ActionInput, options: EvaluateOptions): Promi
   }
   // A deny-level pattern hit blocks the call immediately; no judge, no dialog.
   if (level === "deny") return withPlan({ level, source: "pattern", summary, patterns, reasons });
-  const view = commandOf(action.tool, action.input);
   if (view?.shell && patterns.length === 0 && isReadOnlyCommand(view.command)) {
     return { level, source: "read-only", summary, patterns, reasons };
   }
@@ -2796,8 +3069,8 @@ async function judgeAction(action: ActionInput, options: EvaluateOptions): Promi
 
   // Ask gate: a call that cannot change anything the agent sees is decided by the pattern pass and the floor alone.
   if (config.ask?.enabled !== false) {
-    const decision = actionAskGate(action.tool, action.input, view?.shell ? stripDataText(view.command).text : undefined, action.cwd);
-    if (!decision.ask) {
+    const decision = actionAskGate(action.tool, action.input, shellText, action.cwd, scriptBodies);
+    if (!decision.ask && !bodyHit) {
       applyFloor();
       return withPlan({ level, source: "pattern", summary, patterns, reasons, notAsked: decision.why });
     }
@@ -2812,14 +3085,15 @@ async function judgeAction(action: ActionInput, options: EvaluateOptions): Promi
   // should-proceed only when `shouldProceed.steer` is on. The rules content is only read by the per-violation questions, so it rides the request only while a
   // violation is open.
   const stateRules = remainingViolations.length ? resolved?.content : undefined;
-  const request = buildRequest(summary, action.task, { slop: options.slop?.enabled ?? false, security: options.security?.enabled ?? false, previousActions: options.previousActions, plan, questions: options.questions, rules: stateRules, rulesSource: stateRules ? resolved?.source : undefined, violations: remainingViolations, floorHits, spine: action.spine, largeOutput: options.largeOutput?.enabled ?? false, shouldProceed: config.shouldProceed.steer });
+  const request = buildRequest(summary, action.task, { slop: options.slop?.enabled ?? false, security: options.security?.enabled ?? false, previousActions: options.previousActions, plan, questions: options.questions, rules: stateRules, rulesSource: stateRules ? resolved?.source : undefined, violations: remainingViolations, floorHits, scriptLines, spine: action.spine, largeOutput: options.largeOutput?.enabled ?? false, shouldProceed: config.shouldProceed.steer });
   // One call in twenty also asks the trace-only questions, in a second request that goes out beside the first. Its
   // answers go through the off-task chain and the should-proceed block below, which keep them trace-only, so the
   // recorded signal keeps coming without anything new reaching the agent.
   const traceAnswer = traceSampled(options.traceSample)
-    ? ask(judge, buildRequest(summary, action.task, { traceOnly: true, context: action.context, plan, rules: resolved?.content, rulesSource: resolved?.source, floorHits, spine: action.spine }), { timeoutMs: config.timeoutMs, ...(options.signal ? { signal: options.signal } : {}) })
+    ? ask(judge, buildRequest(summary, action.task, { traceOnly: true, context: action.context, plan, rules: resolved?.content, rulesSource: resolved?.source, floorHits, scriptLines, spine: action.spine }), { timeoutMs: config.timeoutMs, ...(options.signal ? { signal: options.signal } : {}) })
     : undefined;
-  const result = await ask(judge, request, { timeoutMs: config.timeoutMs, ...(options.signal ? { signal: options.signal } : {}) });
+  // No acting question reads another's answer, so none rides in every chunk: the verdict combines them after the merge.
+  const result = await askChunks(judge, chunkEvaluationRequest(request, { maxQuestions: questionLimit(judge) }), { timeoutMs: config.timeoutMs, ...(options.signal ? { signal: options.signal } : {}) });
   if (!result.ok) {
     if (!config.failOpen) {
       level = higher(level, "confirm");
@@ -3050,31 +3324,27 @@ export function releaseHeld(verdict: Verdict, reason: string): void {
  * Without the bound the model writes a full accounting of the notice at the end of every task, which is noise for the
  * user reading the transcript; the wording below caps the demanded reply at one short sentence. */
 export function intentSteer(verdict: Verdict): string {
-  const score = verdict.judgment?.intentMismatch;
   const visible = (verdict.judgment?.visible ?? 0) >= VISIBLE_THRESHOLD ? " and its effect is visible outside the working tree (a commit, push, merge, publish, or launched program)" : "";
-  return `pi-warden: this ${verdict.summary.tool} call does something different from what you said you were about to do${score === undefined ? "" : ` (intent mismatch ${percent(score)})`}${visible}. It ran. Do not write a report about this notice: in your next message, name what changed and why in at most one short sentence, then continue the task (or make the described call if it is still needed). If you already accounted for a similar notice, say nothing more about it.`;
+  return `pi-warden: this ${verdict.summary.tool} call does something different from what you said you were about to do${visible}. It ran. Do not write a report about this notice: in your next message, name what changed and why in at most one short sentence, then continue the task (or make the described call if it is still needed). If you already accounted for a similar notice, say nothing more about it.`;
 }
 
 /** What the agent reads when should_proceed is low: pause and ask the user.
  * One line; the agent must not have forwarded the call without consulting the user. */
 export function shouldProceedMessage(verdict: Verdict): string {
-  const score = verdict.judgment?.shouldProceed;
-  return `pi-warden: this ${verdict.summary.tool} call may need user input before it runs${score === undefined ? "" : ` (should-proceed ${percent(score)})`}. Pause, explain what you are about to do and why, and wait for the user's approval before continuing.`;
+  return `pi-warden: this ${verdict.summary.tool} call may need user input before it runs. Pause, explain what you are about to do and why, and wait for the user's approval before continuing.`;
 }
 
 /** What the agent reads after an unrelated change ran: the request it drifted from, the two acceptable moves, one line. */
 export function offTaskSteer(verdict: Verdict): string {
-  const score = verdict.judgment?.offTask;
-  return `pi-warden: this ${verdict.summary.tool} call looks unrelated to the user's request${score === undefined ? "" : ` (off-task ${percent(score)})`}. It ran. If it serves the request, say how in at most one short sentence; otherwise return to what the user asked for, or ask before widening the work. Do not restate session state or re-answer notices you have already addressed.`;
+  return `pi-warden: this ${verdict.summary.tool} call looks unrelated to the user's request. It ran. If it serves the request, say how in at most one short sentence; otherwise return to what the user asked for, or ask before widening the work. Do not restate session state or re-answer notices you have already addressed.`;
 }
 
 /** What the agent reads the first time a command family is judged noisy: the family and one concrete way to print less. */
 export function largeOutputSteer(verdict: Verdict): string {
   const family = verdict.largeOutputFamily ?? verdict.summary.tool;
-  const score = verdict.judgment?.largeOutput;
   const log = `/tmp/warden-${family.replace(/[^A-Za-z0-9]+/g, "-")}.log`;
   return [
-    `pi-warden: \`${family}\` commands may print far more than you need${score === undefined ? "" : ` (large-output ${percent(score)})`}. This one runs unchanged.`,
+    `pi-warden: \`${family}\` commands may print far more than you need. This one runs unchanged.`,
     `Next time, redirect and show the tail: \`${family} … > ${log} 2>&1; tail -40 ${log}\`.`,
   ].join("\n");
 }
@@ -3092,12 +3362,24 @@ export function textApproves(task: string | undefined): boolean {
   return /\b(?:yes|yep|yeah|go ahead|do it|proceed|approved?|confirm(?:ed)?|ok(?:ay)?|sure|please do|run it)\b/i.test(task ?? "") && !/\b(?:no|don't|do not|stop|wait|instead|not)\b/i.test(task ?? "");
 }
 
+/** A reason with its Jev score removed, for text the agent reads: the words stay, the number goes. */
+export function scoreFreeReason(reason: string): string {
+  return reason
+    .replace(/^irreversible \d+\.\d{2}$/, "irreversible")
+    .replace(/^possibly irreversible \d+\.\d{2}$/, "possibly irreversible")
+    .replace(/^possible security weakness \d+\.\d{2} in written content$/, "possible security weakness in written content")
+    .replace(/^intent mismatch \d+\.\d{2} on a visible action \(\d+\.\d{2}; /, "intent mismatch on a visible action (")
+    .replace(/^intent mismatch \d+\.\d{2} /, "intent mismatch ")
+    .replace(/^should-proceed \d+\.\d{2} /, "should-proceed ")
+    .replace(/^off-task \d+\.\d{2} /, "off-task ");
+}
+
 /**
  * The text the agent receives when a call is held. It explains the judgment and the two acceptable next moves,
- * so the model re-plans instead of retrying. Contains no command text (the model already has it) and no secrets.
+ * so the model re-plans instead of retrying. Contains no command text (the model already has it), no scores, and no secrets.
  */
 export function steerReason(verdict: Verdict, options: { canApprove: boolean }): string {
-  const what = verdict.reasons.join("; ");
+  const what = verdict.reasons.map(scoreFreeReason).join("; ");
   const lines = [
     `pi-warden held this ${verdict.summary.tool} call before it ran: ${what}.`,
     "Do not retry it unchanged. Either (1) reach the goal with a recoverable alternative that stays inside the project (a targeted path, a dry run, a move instead of a delete, a normal push), or (2) if this exact action is genuinely required, stop and tell the user in one or two sentences what it does, what cannot be undone, and why it is needed, then wait for their reply.",

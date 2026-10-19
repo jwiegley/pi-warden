@@ -73,7 +73,7 @@ test("off-task never holds: an unrelated change warns but is trace-only; a read-
   assert.equal(changes.offTaskTraceOnly, true, "steer is trace-only until AUC clears 0.51");
   assert.match(changes.reasons.join("; "), /off-task 0\.91 \(unrelated to the request; trace-only until AUC clears 0\.51\)/);
   assert.equal(changes.offTaskTraceOnlyReasonIndex, changes.reasons.findIndex(reason => reason.startsWith("off-task 0.91")), "delivery metadata identifies only the generated diagnostic");
-  assert.match(offTaskSteer(changes), /^pi-warden: this bash call looks unrelated to the user's request \(off-task 0\.91\)\. It ran\./);
+  assert.match(offTaskSteer(changes), /^pi-warden: this bash call looks unrelated to the user's request\. It ran\./);
   assert.match(formatVerdict(changes), /off task · warn$/);
   const unknown = await evaluateAction(inspect, { config, traceSample: 1, judge: judge(0.05, 0.91, "unrelated") });
   assert.equal(unknown.offTaskSteer, true, "without a mutates answer the call is taken to change something");
@@ -1358,7 +1358,7 @@ test("the agent's plan travels with the request and is judged for intent mismatc
   assert.equal(drift.intentTraceOnly, true, "the default keeps every mismatch in the trace only");
   assert.equal(drift.plan, "Let me first list what is in build/ before removing anything.");
   assert.match(formatVerdict(drift), /off plan · warn$/);
-  assert.match(intentSteer(drift), /^pi-warden: this bash call does something different from what you said you were about to do \(intent mismatch 0\.90\)\. It ran\./);
+  assert.match(intentSteer(drift), /^pi-warden: this bash call does something different from what you said you were about to do\. It ran\./);
   assert.match(intentSteer(drift), /at most one short sentence/, "the steer bounds the demanded reply instead of inviting an accounting");
 
   const told = await evaluateAction({ tool: "bash", input: { command: "rm -rf build" }, cwd, task: "clean the build", plan: "Let me first list what is in build/ before removing anything." }, { config: { ...config.action, intentTraceOnly: "none" }, judge: withIntent(0.9) });
@@ -1436,7 +1436,8 @@ test("steerReason explains the hold and the two acceptable moves without echoing
   const text = steerReason(verdict, { canApprove: true });
   assert.match(text, /held this bash call/);
   assert.match(text, /git force push/);
-  assert.match(text, /irreversible 0\.90/);
+  assert.match(text, /irreversible/);
+  assert.doesNotMatch(text, /irreversible \d+\.\d{2}/, "the score does not reach the agent");
   assert.match(text, /Do not retry it unchanged/);
   assert.match(text, /tell the user/);
   assert.match(text, /retry the same call and pi-warden will let it through/);
@@ -1796,7 +1797,7 @@ test("large output: above the threshold steers once per command family per sessi
   assert.equal(first.level, "allow", "the command is not held or warned");
   assert.deepEqual(first.reasons, []);
   const told = largeOutputNotice(first, steered);
-  assert.equal(told, "pi-warden: `npm test` commands may print far more than you need (large-output 0.92). This one runs unchanged.\nNext time, redirect and show the tail: `npm test … > /tmp/warden-npm-test.log 2>&1; tail -40 /tmp/warden-npm-test.log`.");
+  assert.equal(told, "pi-warden: `npm test` commands may print far more than you need. This one runs unchanged.\nNext time, redirect and show the tail: `npm test … > /tmp/warden-npm-test.log 2>&1; tail -40 /tmp/warden-npm-test.log`.");
   assert.ok(told!.split("\n").length <= 3);
   const again = await evaluateAction({ tool: "bash", input: { command: "CI=1 npm test --verbose" }, cwd, task: "Run the tests and fix the failures" }, { config, judge: largeOutputJudge(0.97), largeOutput: largeOutputOn });
   assert.equal(again.largeOutputFamily, "npm test");
@@ -1864,4 +1865,88 @@ test("commandFamily names the head and, for tools with subcommands, the subcomma
   assert.equal(commandFamily("FOO=1 cat big.log | wc -l"), "cat");
   assert.equal(commandFamily("git"), "git");
   assert.equal(commandFamily("   "), undefined);
+});
+
+// --- Text the shell never runs: comments and quoted messages ----------------------------------
+
+const floorIds = (command: string, options?: Parameters<typeof matchPatterns>[3]) => matchPatterns("bash", { command }, cwd, options).map(hit => hit.id);
+
+test("delete text in a shell comment of a typed command is not held", () => {
+  for (const command of [
+    'true # never rm -rf "$dir" here',
+    '# never rm -rf "$dir"\ntrue',
+    'echo "x" # a | rm -rf ~',
+    // bash reads `$'\''` as one quote character, so the rest of the line is a comment.
+    "echo $'\\'' # '; rm -rf ~",
+  ]) assert.deepEqual(floorIds(command), [], command);
+});
+
+test("a #!/bin/sh first line does not keep a quoted echo message in scope", () => {
+  assert.deepEqual(floorIds('#!/bin/sh\necho "never rm -rf \\"$dir\\" here"'), []);
+  assert.deepEqual(floorIds("#!/bin/sh\nprintf '%s\\n' \"never rm -rf $dir here\""), []);
+});
+
+test("a quoted echo or printf message that holds a separator is one argument, not a command", () => {
+  for (const command of ['echo "a | rm -rf ~"', 'echo "a; rm -rf ~"', "printf '%s\\n' \"x && rm -rf ~\""]) assert.deepEqual(floorIds(command), [], command);
+});
+
+test("a real delete next to a comment, or next to a # that starts no comment, is still held", () => {
+  for (const command of [
+    'rm -rf "$dir" # note',
+    'echo "a # b"; rm -rf ~',
+    "echo a#b; rm -rf ~",
+    "echo a \\\n# note\nrm -rf ~",
+    "echo $'\\' # '; rm -rf ~",
+    "cat <<EOF >/dev/null\n# $(rm -rf ~)\nEOF",
+    "echo hi # it's\nrm -rf ~ # it's",
+    "true # it's\nrm -rf ~ # it's",
+    "echo \"x\" # don't\nrm -rf ~ # won't",
+    "echo `echo x # y` ; rm -rf ~",
+    'echo "a | b" ; rm -rf ~',
+  ]) assert.ok(floorIds(command).includes("rm-recursive-dangerous-target"), command);
+});
+
+test("user command rules and command-surface path rules do not read a shell comment", () => {
+  const commandRules = [{ id: "launchctl-stop", pattern: "\\blaunchctl\\s+(bootout|unload|remove)\\b", severity: "confirm" as const }];
+  assert.deepEqual(floorIds("true # launchctl bootout gui/501/com.example.job", { commandRules }), []);
+  assert.deepEqual(floorIds("launchctl bootout gui/501/com.example.job # stop it", { commandRules }), ["launchctl-stop"]);
+  const pathRules = [{ id: "vault", paths: ["**/vault.key"], access: "none" as const, tools: ["*"], action: "confirm" as const }];
+  assert.deepEqual(floorIds("ls # vault.key stays put", { pathRules }), []);
+  assert.deepEqual(floorIds("cat vault.key # read it", { pathRules }), ["vault"]);
+});
+
+// --- Backslash-newlines and here-strings, read as bash reads them -------------------------------
+
+test("a typed delete split by a backslash-newline is held", () => {
+  for (const command of ["r\\\nm -rf ~", "rm \\\n-rf ~", "rm -rf \\\n~", "\\\nrm -rf ~", "true &&\\\nrm -rf ~"]) {
+    assert.ok(floorIds(command).includes("rm-recursive-dangerous-target"), JSON.stringify(command));
+  }
+});
+
+test("a here-string or a partly quoted heredoc delimiter starts no body that hides the lines after it", () => {
+  for (const command of [
+    "cat <<< b\nrm -rf ~",
+    "cat <<<b\nrm -rf ~",
+    "cat <<E\"O\"F >/dev/null\nEOF\nrm -rf ~",
+    "echo '<<F'\nrm -rf ~",
+    "echo \"<<F\"\nrm -rf ~",
+    "echo x # <<F\nrm -rf ~",
+    // bash joins a backslash-newline in an unquoted body before it matches the delimiter, so `EO\<nl>F` ends the body.
+    "cat <<EOF >/dev/null\nEO\\\nF\nrm -rf ~",
+    "cat <<-X >/dev/null\n\tnote\n\tX\nrm -rf ~",
+    "cat <\\\n<< b >/dev/null\nrm -rf ~",
+    "cat <\\\n<EOF | sh\nrm -rf ~\nEOF",
+  ]) assert.ok(floorIds(command).includes("rm-recursive-dangerous-target"), JSON.stringify(command));
+});
+
+test("a backslash-newline in quotes or in a data heredoc does not turn the text into a command", () => {
+  for (const command of [
+    'echo "a\\\nrm -rf ~"',
+    "echo 'a\\\nrm -rf ~'",
+    "cat > notes.txt <<'EOF'\nstep one \\\nrm -rf ~\nEOF",
+    // The joined line `x EOF` is no delimiter, so the body runs on to the last EOF.
+    "cat <<EOF >/dev/null\nx \\\nEOF\nrm -rf ~\nEOF",
+    "cat <<E\"O\"\\\nF >/dev/null\nrm -rf ~\nEOF",
+    "cat <<\\\n-X >/dev/null\n\trm -rf ~\n\tX",
+  ]) assert.deepEqual(floorIds(command), [], JSON.stringify(command));
 });

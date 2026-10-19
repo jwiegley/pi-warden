@@ -68,7 +68,11 @@ calculation behind its batch size is `power.mjs` (`npm run eval:power`).
   trace file: TypeSafe unavailable, judgments off, a spend-cap stop) stops the batch;
   the runner leaves that run out of `runs.json` and exits with code 3. A request still
   in flight when the run's process exited, with no fallback in the trace, is recorded as
-  `abandonedJevRequests` and stops nothing.
+  `abandonedJevRequests` and stops nothing. A run whose one failed request is a
+  cancelled trace-only sample (the guard's second request on one judged call in twenty)
+  is recorded as `cancelledTraceSamples: 1` and stops nothing. The check reads times: the
+  action entry with a `jev:` line nearest in time to the failure's `lastFailure.at` must be
+  within 1,000 ms of it and have no `off-task` answer.
 - `batch.mjs`: how the batch is scheduled. One block per task x repeat, repeat by
   repeat, with the cell order of each block shuffled by a seed (`--seed`, recorded in
   `runs.json` and the report) and its runs dispatched one after another; `--resume DIR`
@@ -78,13 +82,38 @@ calculation behind its batch size is `power.mjs` (`npm run eval:power`).
   retried and got past is a valid run, counted as `providerErrorsRecovered`) is re-run
   after 1 and 5 minutes (`--retry-delays 60,300`) and then
   recorded with `infraError`, its whole block flagged `excludedBlock` and left out of
-  the report's metrics; 5 such failures in a row stop the batch with exit code 4, and all 5 run again on
+  the report's metrics; a run whose session log shows no new assistant message or tool
+  result for `--stall-min` minutes (default 15; `stall.mjs`) is killed as stalled and is
+  such a failure too, and `--arc-timeout-min` is the timeout of one turn of a multi-turn
+  run (default `--timeout-min`); 5 such failures in a row stop the batch with exit code 4, and all 5 run again on
   resume;
   `--jev-usd-cap N` stops the batch at N Jev dollars with exit code 3. Both stops
-  resume with `--resume`, which refuses `--typesafe-cap`. A run killed at the timeout
+  resume with `--resume`, which refuses `--typesafe-cap`. `--rerun-excluded` (with
+  `--resume DIR`, once the main pass is finished: every planned run recorded) runs every
+  block that holds an `infraError` run once more, all three cells in the registered cell
+  order. The first runs of those blocks move to the `superseded` list of `runs.json` with
+  `supersededAt` and their evidence folders to `DIR/superseded/`, and they leave every
+  metric while their Jev dollars stay in the batch total. One pass per batch: the
+  exclusions after the pass are final (the 10% limit applies to them), and a stop during
+  the pass resumes with a plain `--resume`. A run killed at the timeout
   whose Jev ledger cannot be read has an unknown Jev cost (`cost.jevUnknown`): it stays
   out of the dollar columns, and the report counts it. The report builders drop the
   excluded blocks themselves, so a report rebuilt from `runs.json` matches.
+- `decide.mjs` + `scripts/thesis-decide.mjs`: the decision rules of the registration
+  (`preregistration.md`, "Decision rules", Corrections 7). `decide.mjs` is pure: the per-run
+  values, the paired blocks, the exact McNemar p, the one-sided Clopper-Pearson lower bound
+  (bisection on the binomial tail), the violation rate ratio and its lower bound, the paired
+  bootstrap (20,000 resamples from `seededRandom(20261001)`, the 1,000th and 19,000th smallest
+  estimates), the Wald and delta-method sensitivity bounds, and the decision of each rule and of
+  the model. `node scripts/thesis-decide.mjs <runs.json> --label A --blocks 120` prints the
+  decision table as Markdown (`--json` for JSON); `--metrics FILE` writes the per-run values of
+  the analysis set (task, family, repeat, cell, s, v, c, h, t) and prints no table, and a `--metrics`
+  file given as the input prints the same decision table, with a first line that says so.
+  `tests/eval-decide.test.ts`
+  checks it on made-up data.
+- `scripts/thesis-pooled.mjs`: the post hoc, pooled view of both models' runs for the three
+  thesis claims (the hallucination proxy, the pooled paired success, and the token summary);
+  it labels every number post hoc and decides nothing, and `--json` prints the same as JSON.
 - `weak-tasks.mjs` + `weak.mjs`: the weak-model suite (`--suite weak`). Eight everyday
   requests, each with one trap and a scripted harm and success check read from the
   run's files, its bare origin, a sandbox (a `sudo` shim that logs and fails, global
@@ -99,9 +128,14 @@ Run: `npm run eval:ab -- --repeats 3 --concurrency 6 --model <provider/model>`. 
 batch runs under `caffeinate -i`, with a Jev dollar cap, and resumes after a stop:
 
 ```
-caffeinate -i node scripts/eval-ab.mjs --model <provider/model> --repeats 143 --turns 12 --concurrency 10 --seed 20261001 --jev-usd-cap 8
-caffeinate -i node scripts/eval-ab.mjs --resume eval/reports/<batch folder> --concurrency 10 --jev-usd-cap 8
+caffeinate -i node scripts/eval-ab.mjs --model <provider/model> --repeats 6 --turns 12 --concurrency 3 --seed 20261001 --stall-min 15 --jev-usd-cap 3 --out <batch folder>
+caffeinate -i node scripts/eval-ab.mjs --resume <batch folder> --concurrency 3 --jev-usd-cap 3
 ```
+
+A batch on the CheapestInference subscription adds `--extension ~/.pi/agent/extensions/cheapest-inference.ts`
+(also on a resume) and `PI_CHEAPEST_QUEUE_DEBUG=1`. `scripts/eval-timing.mjs <batch folder>`
+then prints per-run wall time and the per-call queue wait and generation time from the
+queue lines in each run's stderr log, and runs per hour; it reads timings, never outcomes.
 
 Exit codes: 0 finished, 2 bad arguments, 3 stopped by a Jev error or the Jev cap, 4
 stopped by 5 infrastructure failures in a row, 130 interrupted.
