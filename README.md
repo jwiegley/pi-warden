@@ -200,3 +200,12 @@ npm run dev:pi       # start Pi with this working tree
 ```
 
 MIT licensed.
+
+## Maintained fork
+
+This fork tracks upstream v1.11.2 and pins the `jwiegley/pi-typesafe` v0.10.0
+source archive by commit. `npm ci && npm run check` builds that dependency
+before Warden. `npm pack` bundles the compiled TypeSafe fork and its runtime
+dependencies so the installed artifact also works. Nix substitutes the same fork's separately built artifact.
+Model selection stays in user configuration: select an OpenRouter endpoint
+with `defaultModel: "~typesafe/jev-latest"`; neither fork changes SDK model defaults.
