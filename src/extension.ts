@@ -12,7 +12,8 @@ type MouseRegionConstructor = new (child: ReturnType<typeof statusWidget>, onMou
 const MouseRegion: MouseRegionConstructor | undefined = (tuiModule as Partial<{ MouseRegion: MouseRegionConstructor }>).MouseRegion;
 import { authState, backendHost, createTypeSafe, resolveBackend, chunkEvaluationRequest } from "pi-typesafe";
 import type { TypeSafe } from "pi-typesafe";
-import { ensureApiKey } from "pi-typesafe/ui";
+import { ensureApiKey, loginWithPrompt } from "pi-typesafe/ui";
+import type { EnsureApiKeyResult } from "pi-typesafe/ui";
 import { LOGIN_HINT, backendName, describeBackend, describeKey, disclosureFor, enableKeyRefusal, judgeOptions, loginStoresKey } from "./backend.js";
 import type { BackendSetting, JudgmentsOffReason } from "./backend.js";
 import { ActionGuard } from "./action-guard.js";
@@ -287,7 +288,7 @@ export function judgmentsOffText(reason: Exclude<JudgmentsOffReason, "budget">, 
       // /warden enable saves only the TypeSafe key. Another backend's stored key came from elsewhere, and that backend's
       // variable, which pi-typesafe reads first, is how it is replaced.
       return loginStoresKey(backend)
-        ? "warden: Jev judgments are off (the key saved by /warden enable was rejected). Delete pi-typesafe/auth.json, then run /warden enable."
+        ? "warden: Jev judgments are off (the key saved by /warden enable was rejected). Run /warden enable to replace it."
         : `warden: Jev judgments are off (the key stored for ${backendName(backend)} in pi-typesafe/auth.json was rejected). Set ${resolveBackend(backend).keyEnv}.`;
     }
   }
@@ -3544,7 +3545,17 @@ export default function wardenExtension(host: ExtensionAPI): void {
           // One flow: consent, then a key if none is configured yet. Only TypeSafe can arrive here without one: ensureApiKey
           // prompts for it, verifies it, and stores it for every pi-typesafe consumer. Any other backend arrives with its
           // variable exported, which ensureApiKey returns without a prompt.
-          const key = await ensureApiKey(ctx, { ...(backend === undefined ? {} : { backend }), loginHint: LOGIN_HINT });
+          // ensureApiKey returns a saved key as it is, even one TypeSafe rejected (401 or 403). That key is replaced here,
+          // the job upstream leaves to pi-typesafe's own login command: the prompt proves the new key before it overwrites
+          // the TypeSafe entry, so a cancel leaves the store as it was, and no other backend's stored key is touched.
+          const saved = backend !== undefined && loginStoresKey(backend) ? authState({ backend, loginHint: LOGIN_HINT }) : undefined;
+          let key: EnsureApiKeyResult | undefined;
+          if (saved?.kind === "stored" && !saved.usable) {
+            const login = await loginWithPrompt(ctx, { backend: saved.backend });
+            key = login ? { source: "stored", login } : undefined;
+          } else {
+            key = await ensureApiKey(ctx, { ...(backend === undefined ? {} : { backend }), loginHint: LOGIN_HINT });
+          }
           // Only the TypeSafe prompt can be cancelled, so the console named here is TypeSafe's.
           if (!key) { report("No key entered; pi-warden stays on pattern checks only. Run /warden enable again when you have a key from console.typesafe.ai.", "warning"); return; }
           const path = writeUserSetting("typesafe", true);

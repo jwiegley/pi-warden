@@ -223,7 +223,10 @@ The fork's own changes, replayed onto each release:
   absolute or climbing entries are dropped with a warning.
 - Session history is read through the host's bounded reads when it has them.
 - Hints about the TypeSafe key name `/warden enable`, which pi-warden
-  registers, instead of `/typesafe login`, which it never loads.
+  registers, instead of `/typesafe login`, which it never loads. Where upstream
+  sends the user to `/typesafe login` to replace a saved key that TypeSafe
+  rejected, `/warden enable` does it: it asks for a new key, proves it, and then
+  overwrites only the TypeSafe entry in `pi-typesafe/auth.json`.
 - `/warden enable` asks for and stores the TypeSafe key only. Every other
   backend, an endpoint object included, takes its key from its own environment
   variable: without that variable exported, `/warden enable` refuses before the
