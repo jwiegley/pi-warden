@@ -50,9 +50,14 @@ export function backendName(backend: JudgmentBackend | undefined): string {
  */
 export const LOGIN_HINT = "/warden enable";
 
-/** Whether the login store can hold this backend's key, so `/warden enable` can store it. It names a registry backend; an endpoint object cannot be named. */
+/**
+ * Whether `/warden enable` can store this backend's key. This fork bundles the pinned pi-typesafe fork (0.10.0 with
+ * `loginHint`), whose login store keeps the TypeSafe key only: its `ensureApiKey` refuses any other backend and points
+ * at the backend's variable instead. So this is true only for "typesafe" until the pin moves to a pi-typesafe 0.12 or
+ * later fork, which keeps one key per registry backend and is what upstream's every-registry-name answer assumes.
+ */
 export function loginStoresKey(backend: JudgmentBackend | undefined): boolean {
-  return typeof (backend ?? DEFAULT_BACKEND) === "string";
+  return backend === DEFAULT_BACKEND;
 }
 
 /** One phrase naming where judgments go — the label, the host, and the model sent — for consent text and status lines. */

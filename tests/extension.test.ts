@@ -532,11 +532,10 @@ test("an answer from a model other than the calibration model is recorded", asyn
   }
 });
 
-test("PI_WARDEN_DB is set and not under the real home directory", () => {
+test("PI_WARDEN_DB is confined to this test fixture", () => {
   const dbPath = process.env.PI_WARDEN_DB;
   assert.ok(dbPath, "PI_WARDEN_DB must be set before extension tests run");
-  const home = homedir();
-  assert.ok(!dbPath.startsWith(home), `PI_WARDEN_DB (${dbPath}) must not be under the real home directory (${home})`);
+  assert.equal(dbPath, join(temporary, "agent", "pi-warden", "holds.db"), "the database must stay in the isolated fixture, even when TMPDIR is under home");
 });
 
 test("should-proceed defaults to trace-only for interactive and headless agents", async () => {
@@ -3015,7 +3014,7 @@ test("/warden enable without a key asks for one after consent, verifies it, stor
     await runCommand("enable");
     assert.equal(modelListCalls, 1);
     assert.deepEqual(JSON.parse(await readFile(configPath(), "utf8")), { typesafe: true });
-    assert.deepEqual(JSON.parse(await readFile(storedKeyPath, "utf8")), { version: 1, keys: { typesafe: keyInput } });
+    assert.deepEqual(JSON.parse(await readFile(storedKeyPath, "utf8")), { apiKey: keyInput }, "the pinned pi-typesafe fork stores the TypeSafe key alone");
     assert.match(notices.at(-1)!.text, /key verified \(1 model\) and stored at/);
     assert.ok(notices.every(notice => !notice.text.includes("ts_live_key")), "the key is never echoed");
 
@@ -5012,13 +5011,13 @@ test("judgments off: each reason is said once per session with its fix, and work
   assert.deepEqual(judgmentsOff(), [], "a session with working judgments shows no notice");
 });
 
-test("judgments off: no key on OpenRouter names its variable and pi-warden's own login", async () => {
+test("judgments off: no key on OpenRouter names only its variable, since /warden enable stores no OpenRouter key", async () => {
   await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: "openrouter", rules: { enabled: false }, ...STACK_BAR }));
   const savedOpenRouter = process.env.OPENROUTER_API_KEY;
   delete process.env.OPENROUTER_API_KEY;
   try {
     await toolCall("bash", { command: "npm test" });
-    assert.deepEqual(judgmentsOff(), ["warden: Jev judgments are off (no key for openrouter). Set OPENROUTER_API_KEY or run /warden enable."]);
+    assert.deepEqual(judgmentsOff(), ["warden: Jev judgments are off (no key for openrouter). Set OPENROUTER_API_KEY."]);
     assert.equal(networkCalls, 0);
   } finally {
     if (savedOpenRouter !== undefined) process.env.OPENROUTER_API_KEY = savedOpenRouter;

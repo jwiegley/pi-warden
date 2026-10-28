@@ -192,9 +192,30 @@ MIT licensed.
 
 ## Maintained fork
 
-This fork tracks upstream v1.11.2 and pins the `jwiegley/pi-typesafe` v0.10.0
+This fork tracks upstream v2.2.5 and pins the `jwiegley/pi-typesafe` v0.10.0
 source archive by commit. `npm ci && npm run check` builds that dependency
 before Warden. `npm pack` bundles the compiled TypeSafe fork and its runtime
 dependencies so the installed artifact also works. Nix substitutes the same fork's separately built artifact.
 Model selection stays in user configuration: select an OpenRouter endpoint
 with `defaultModel: "~typesafe/jev-latest"`; neither fork changes SDK model defaults.
+
+The fork's own changes, replayed onto each release:
+
+- `PI_WARDEN_DEFAULT_CONSENT=1` and `PI_WARDEN_DEFAULT_BACKEND` fill consent and
+  the backend only where the user file records no choice of its own;
+  `PI_WARDEN_BACKEND` replaces the backend for one process; a `PI_WARDEN_ENABLED`
+  value other than 1, true, yes, or on withdraws consent. A user file that cannot
+  be read while managed defaults are set turns judgments off, and no writer
+  replaces it.
+- Session history is read through the host's bounded reads when it has them.
+- Every hint names `/warden enable`, which pi-warden registers, instead of
+  `/typesafe login`, which it never loads.
+- Offline checks that depended on host timing or Git display settings are
+  deterministic.
+
+The pinned pi-typesafe predates the per-backend key store of pi-typesafe 0.12,
+so `/warden enable` stores the TypeSafe key only: every other registry backend
+reads its key from its environment variable, and upstream's
+`/typesafe login <backend>` flow, which the configuration docs describe, does
+not apply here. Pi on Bun also needs pi-typesafe 0.13.1's response-body replay,
+which this pin lacks; Pi on Node is unaffected.

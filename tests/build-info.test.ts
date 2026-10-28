@@ -19,7 +19,7 @@ test("satisfiesCaret reads the caret range pi-warden declares", () => {
 test("readWardenBuild names the running package and the loaded pi-typesafe", () => {
   const build = readWardenBuild();
   assert.match(build.version, /^\d+\.\d+\.\d+/, "the package version is a semantic version");
-  assert.match(build.typesafeRange ?? "", /^\^\d+\.\d+\.\d+$/, "the pi-typesafe dependency is a caret range");
+  assert.match(build.typesafeRange ?? "", /^https:\/\/github\.com\/jwiegley\/pi-typesafe\/archive\/[0-9a-f]{40}\.tar\.gz$/, "the pi-typesafe dependency pins our fork by immutable commit");
   assert.match(build.typesafeVersion ?? "", /^\d+\.\d+\.\d+/, "the loaded pi-typesafe version is resolved");
   assert.equal(typeof build.stale, "boolean", "staleness is always decided");
   assert.ok(build.commit === undefined || /^[0-9a-f]{7,}$/.test(build.commit), "a commit is a short or full hash when the package is a checkout");
