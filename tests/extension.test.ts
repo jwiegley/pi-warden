@@ -3014,7 +3014,7 @@ test("/warden enable without a key asks for one after consent, verifies it, stor
     await runCommand("enable");
     assert.equal(modelListCalls, 1);
     assert.deepEqual(JSON.parse(await readFile(configPath(), "utf8")), { typesafe: true });
-    assert.deepEqual(JSON.parse(await readFile(storedKeyPath, "utf8")), { apiKey: keyInput }, "the pinned pi-typesafe fork stores the TypeSafe key alone");
+    assert.deepEqual(JSON.parse(await readFile(storedKeyPath, "utf8")), { version: 1, keys: { typesafe: keyInput } }, "pi-typesafe's store holds the TypeSafe key, the one key /warden enable asks for");
     assert.match(notices.at(-1)!.text, /key verified \(1 model\) and stored at/);
     assert.ok(notices.every(notice => !notice.text.includes("ts_live_key")), "the key is never echoed");
 
@@ -3059,6 +3059,72 @@ test("/warden enable without the variable of a backend other than TypeSafe refus
     }
   } finally {
     if (savedOpenRouter === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = savedOpenRouter;
+  }
+});
+
+test("/warden enable does not count a key that another pi-typesafe consumer stored for a backend other than TypeSafe", async () => {
+  const savedOpenRouter = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  const storedKeyPath = join(temporary, "agent", "pi-typesafe", "auth.json");
+  // pi-typesafe reads this key after the variable; pi-warden asks for the variable itself.
+  const stored = JSON.stringify({ version: 1, keys: { openrouter: "sk-or-stored-test-key-0123456789" } });
+  try {
+    await writeConfig(JSON.stringify({ typesafeBackend: "openrouter", rules: { enabled: false }, ...STACK_BAR }));
+    await mkdir(join(temporary, "agent", "pi-typesafe"), { recursive: true });
+    await writeFile(storedKeyPath, stored, { mode: 0o600 });
+    const saved = await readFile(configPath(), "utf8");
+    await runCommand("enable");
+    // Everything at once, so a failure shows the whole outcome: what was asked, said, stored, and saved.
+    assert.deepEqual({
+      consentDialogs: confirms.length,
+      keyPrompts,
+      notice: notices.at(-1)?.text,
+      store: await readFile(storedKeyPath, "utf8"),
+      consentSaved: (await readFile(configPath(), "utf8")) !== saved,
+    }, {
+      consentDialogs: 0,
+      keyPrompts: 0,
+      notice: "Cannot enable judgments: no OpenRouter key. Set OPENROUTER_API_KEY in the environment; /warden enable stores a TypeSafe key only.",
+      store: stored,
+      consentSaved: false,
+    });
+  } finally {
+    if (savedOpenRouter === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = savedOpenRouter;
+  }
+});
+
+test("/warden status names only the variable for a backend whose key pi-warden never asks for", async () => {
+  const savedOpenRouter = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  const store = join(temporary, "agent", "pi-typesafe");
+  // The status report is one line; the key sentence ends where the build line starts.
+  const keySentence = async (): Promise<string> => {
+    await runCommand("status");
+    return /OpenRouter key: .*?(?= Build: pi-warden )/.exec(notices.at(-1)!.text)?.[0] ?? "no key sentence";
+  };
+  try {
+    for (const typesafeBackend of ["openrouter", openRouterEndpoint]) {
+      const label = JSON.stringify(typesafeBackend);
+      await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend, rules: { enabled: false }, ...STACK_BAR }));
+      assert.equal(await keySentence(), "OpenRouter key: missing — every Jev judgment is skipped until OPENROUTER_API_KEY is set in the environment.", label);
+
+      // A store other users can read: the chmod is the whole fix, since /warden enable takes no OpenRouter key.
+      await mkdir(store, { recursive: true });
+      await writeFile(join(store, "auth.json"), JSON.stringify({ version: 1, keys: { typesafe: "ts-stored-test-key-0123456789" } }));
+      await chmod(join(store, "auth.json"), 0o644);
+      assert.match(await keySentence(), /^OpenRouter key: unusable \(Refusing to read \S*pi-typesafe\/auth\.json: it is readable by other users\. Run chmod 600 on it\.\) — every Jev judgment is skipped until OPENROUTER_API_KEY is set in the environment\.$/, label);
+
+      // A key another pi-typesafe consumer stored for this backend: pi-typesafe reads it after the variable, and the
+      // status says where it is, not that /warden enable saved it.
+      const id = typeof typesafeBackend === "string" ? typesafeBackend : typesafeBackend.keyEnv;
+      await writeFile(join(store, "auth.json"), JSON.stringify({ version: 1, keys: { [id]: "sk-or-stored-test-key-0123456789" } }));
+      await chmod(join(store, "auth.json"), 0o600);
+      assert.equal(await keySentence(), "OpenRouter key: a key stored in pi-typesafe/auth.json (not verified yet — the first request proves it).", label);
+      await rm(store, { recursive: true, force: true });
+    }
+  } finally {
+    if (savedOpenRouter === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = savedOpenRouter;
+    await rm(store, { recursive: true, force: true });
   }
 });
 

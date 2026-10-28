@@ -203,7 +203,7 @@ MIT licensed.
 
 ## Maintained fork
 
-This fork tracks upstream v2.2.5 and pins the `jwiegley/pi-typesafe` v0.10.0
+This fork tracks upstream v2.2.5 and pins the `jwiegley/pi-typesafe` v0.13.1
 source archive by commit. `npm ci && npm run check` builds that dependency
 before Warden. `npm pack` bundles the compiled TypeSafe fork and its runtime
 dependencies so the installed artifact also works. Nix substitutes the same fork's separately built artifact.
@@ -222,19 +222,19 @@ The fork's own changes, replayed onto each release:
 - A project file's `rules.files` may name only files inside the project;
   absolute or climbing entries are dropped with a warning.
 - Session history is read through the host's bounded reads when it has them.
-- Every hint names `/warden enable`, which pi-warden registers, instead of
-  `/typesafe login`, which it never loads.
+- Hints about the TypeSafe key name `/warden enable`, which pi-warden
+  registers, instead of `/typesafe login`, which it never loads.
 - `/warden enable` asks for and stores the TypeSafe key only. Every other
   backend, an endpoint object included, takes its key from its own environment
   variable: without that variable exported, `/warden enable` refuses before the
-  consent dialog and never prompts for the key or writes it to disk, and a judge
-  paused by a rejected key names the variable, not `/warden enable`.
+  consent dialog and never prompts for the key or writes it to disk.
+  `/warden status`, the judgments-off notice, and a judge paused by a rejected
+  key name that variable, not `/warden enable`.
 - Offline checks that depended on host timing or Git display settings are
   deterministic.
 
-The pinned pi-typesafe predates the per-backend key store of pi-typesafe 0.12,
-so `/warden enable` stores the TypeSafe key only: every other registry backend
-reads its key from its environment variable, and upstream's
-`/typesafe login <backend>` flow, which the configuration docs describe, does
-not apply here. Pi on Bun also needs pi-typesafe 0.13.1's response-body replay,
-which this pin lacks; Pi on Node is unaffected.
+pi-typesafe 0.12 and later keep a stored key for every backend, and upstream
+offers `/typesafe login <backend>` for each one, as the configuration docs
+describe. That flow does not apply here, because `/warden enable` stores the
+TypeSafe key only. pi-typesafe still reads a key that some other consumer stored
+for another backend, after that backend's variable; pi-warden never writes one.

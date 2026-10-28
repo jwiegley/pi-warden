@@ -94,7 +94,7 @@
     "typescript": "^6.0.0"
   },
   "dependencies": {
-    "pi-typesafe": "https://github.com/jwiegley/pi-typesafe/archive/afce85119af1b1e2e67ff21f9727bfb72fedf641.tar.gz"
+    "pi-typesafe": "https://github.com/jwiegley/pi-typesafe/archive/0a70be0c817c3aca428a6f69599e9017fe96411e.tar.gz"
   },
   "bundledDependencies": [
     "pi-typesafe"

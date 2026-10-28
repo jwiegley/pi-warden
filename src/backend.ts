@@ -1,5 +1,5 @@
-import type { BackendSpec, TypeSafeOptions } from "pi-typesafe";
-import { DEFAULT_BACKEND, DECISIONS_BACKENDS, backendHost, resolveBackend } from "pi-typesafe";
+import type { AuthReport, BackendSpec, TypeSafeOptions } from "pi-typesafe";
+import { DEFAULT_BACKEND, DECISIONS_BACKENDS, authState, backendHost, describeAuth, resolveBackend } from "pi-typesafe";
 
 /** The judgment backend: a registry name ("typesafe", "openrouter", "commandcode") or a caller-supplied endpoint object. */
 export type JudgmentBackend = BackendSpec;
@@ -73,6 +73,34 @@ export function enableKeyRefusal(backend: JudgmentBackend, env: NodeJS.ProcessEn
   const { label, keyEnv } = resolveBackend(backend);
   if (env[keyEnv]?.trim()) return undefined;
   return `Cannot enable judgments: no ${label} key. Set ${keyEnv} in the environment; ${LOGIN_HINT} stores a TypeSafe key only.`;
+}
+
+/** How `/warden status` names a key that pi-typesafe holds for a backend whose key pi-warden never asks for or saves. */
+export const STORED_KEY_NAME = "a key stored in pi-typesafe/auth.json";
+
+/**
+ * The key sentence of `/warden status`. Given pi-warden's login hint, pi-typesafe's describeAuth offers `/warden enable`
+ * for every backend, which is right only for TypeSafe, the one key that command asks for. Every other backend's
+ * sentence names its variable alone: a missing key waits for that variable, a store other users can read asks for the
+ * chmod and nothing more, and a key pi-typesafe 0.12 and later read from its store for that backend is named by where
+ * it is, because pi-warden never saved it.
+ */
+export function describeKey(backend: JudgmentBackend): AuthReport {
+  const state = authState({ backend, loginHint: LOGIN_HINT });
+  if (loginStoresKey(backend)) return describeAuth(state, LOGIN_HINT);
+  const { label, keyEnv } = resolveBackend(backend);
+  const since = state.lastFailure ? ` Last failure: ${state.lastFailure.message}${state.lastFailure.at ? ` (${state.lastFailure.at})` : ""}` : "";
+  const until = `every Jev judgment is skipped until ${keyEnv} is set in the environment`;
+  if (state.kind === "missing") return { level: "error", text: `${label} key: missing — ${until}.${since}` };
+  if (state.kind === "unusable") return { level: "error", text: `${label} key: unusable (${withoutLoginStep(state.reason)}) — ${until}.${since}` };
+  return describeAuth(state.kind === "stored" ? { ...state, keyName: STORED_KEY_NAME } : state, LOGIN_HINT);
+}
+
+/** pi-typesafe's refusal of a store other users can read, without the step after chmod that names `/warden enable`. */
+function withoutLoginStep(reason: string | undefined): string {
+  if (reason === undefined) return "unknown reason";
+  const step = `, then run ${LOGIN_HINT} again.`;
+  return reason.endsWith(step) ? `${reason.slice(0, -step.length)}.` : reason;
 }
 
 /** One phrase naming where judgments go — the label, the host, and the model sent — for consent text and status lines. */
