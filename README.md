@@ -239,13 +239,16 @@ The fork's own changes, replayed onto each release:
   backend, an endpoint object included, takes its key from its own environment
   variable: without that variable exported, `/warden enable` refuses before the
   consent dialog and never prompts for the key or writes it to disk.
-  `/warden status`, the judgments-off notice, and a judge paused by a rejected
-  key name that variable, not `/warden enable`.
+  Judgments for such a backend use that variable alone; a key stored for it in
+  `pi-typesafe/auth.json` is ignored, and `/warden status` reports the key as
+  missing until the variable is set. `/warden status`, the judgments-off notice,
+  and a judge paused by a rejected key name that variable, not `/warden enable`.
 - Offline checks that depended on host timing or Git display settings are
   deterministic.
 
 pi-typesafe 0.12 and later keep a stored key for every backend, and upstream
 offers `/typesafe login <backend>` for each one, as the configuration docs
 describe. That flow does not apply here, because `/warden enable` stores the
-TypeSafe key only. pi-typesafe still reads a key that some other consumer stored
-for another backend, after that backend's variable; pi-warden never writes one.
+TypeSafe key only. pi-typesafe would also read a key that some other consumer
+stored for another backend once that backend's variable is unset; pi-warden
+never writes one and never judges with one.

@@ -264,9 +264,9 @@ function planForCall(entries: ReturnType<ExtensionContext["sessionManager"]["get
 
 /**
  * The once-per-session notice: why Jev judgments are off and what turns them on. `rejectedEnv` is the environment
- * variable that holds a rejected key, or undefined when the rejected key is a stored one: for TypeSafe the key
- * `/warden enable` saved, for any other backend a key some other pi-typesafe consumer stored. Never names a key value
- * or an absolute path.
+ * variable that holds a rejected key, or undefined when the caller does not name one. Only TypeSafe judges with a stored
+ * key, the one `/warden enable` saved; every other backend judges with its own variable alone (see judgmentsOffReason),
+ * so its rejected key is always that variable's. Never names a key value or an absolute path.
  */
 export function judgmentsOffText(reason: Exclude<JudgmentsOffReason, "budget">, setting: BackendSetting, headless: boolean, rejectedEnv?: string): string {
   switch (reason) {
@@ -283,13 +283,13 @@ export function judgmentsOffText(reason: Exclude<JudgmentsOffReason, "budget">, 
       return `warden: Jev judgments are off (no key for ${backendName(backend)}). Set ${resolveBackend(backend).keyEnv}${hint}.`;
     }
     case "key_rejected": {
-      if (rejectedEnv) return `warden: Jev judgments are off (the key in ${rejectedEnv} was rejected). Check the key, then run /warden status.`;
       const backend = setting.typesafeBackend;
-      // /warden enable saves only the TypeSafe key. Another backend's stored key came from elsewhere, and that backend's
-      // variable, which pi-typesafe reads first, is how it is replaced.
-      return loginStoresKey(backend)
-        ? "warden: Jev judgments are off (the key saved by /warden enable was rejected). Run /warden enable to replace it."
-        : `warden: Jev judgments are off (the key stored for ${backendName(backend)} in pi-typesafe/auth.json was rejected). Set ${resolveBackend(backend).keyEnv}.`;
+      // A backend whose key /warden enable never saves is judged only with its variable's key, so a rejection there names
+      // that variable even when the caller (the rules and bench reports) passes none.
+      const rejectedIn = rejectedEnv || (loginStoresKey(backend) ? undefined : resolveBackend(backend).keyEnv);
+      return rejectedIn
+        ? `warden: Jev judgments are off (the key in ${rejectedIn} was rejected). Check the key, then run /warden status.`
+        : "warden: Jev judgments are off (the key saved by /warden enable was rejected). Run /warden enable to replace it.";
     }
   }
 }
@@ -822,6 +822,10 @@ export default function wardenExtension(host: ExtensionAPI): void {
     if (!consentGiven(config)) return "no_consent";
     if (budgetExhausted) return "budget";
     const auth = authState({ backend, loginHint: LOGIN_HINT });
+    // Only TypeSafe may judge with a key from pi-typesafe's store, the one /warden enable saved. Every other backend
+    // judges with its own variable alone: pi-typesafe 0.12 and later fall back to a key stored for it once the variable
+    // is unset, and that key counts as none here, so judgeFor never builds a client that would read it.
+    if (!loginStoresKey(backend) && auth.source === "stored") return "no_key";
     if (auth.usable) return undefined;
     // No key in effect, or one whose last request came back 401 or 403.
     return auth.source === undefined ? "no_key" : "key_rejected";

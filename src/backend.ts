@@ -51,11 +51,13 @@ export function backendName(backend: JudgmentBackend | undefined): string {
 export const LOGIN_HINT = "/warden enable";
 
 /**
- * Whether `/warden enable` asks for and stores this backend's key. Only the TypeSafe key is ever asked for: every other
- * backend's credential stays in the environment, in that backend's own variable, so pi-warden never prompts for it and
- * never writes it to disk. That is policy, not a limit of pi-typesafe: from 0.12 on its login store keeps a key for any
- * backend, and upstream pi-warden offers it for every registry name. True only for "typesafe"; an endpoint object
- * always names its own variable, and a refused backend (undefined) names no store.
+ * Whether `/warden enable` asks for and stores this backend's key, and so whether pi-warden judges with a key from
+ * pi-typesafe's store for it. Only the TypeSafe key is ever asked for: every other backend's credential stays in the
+ * environment, in that backend's own variable, so pi-warden never prompts for it, never writes it to disk, and never
+ * judges with a key stored for it. That is policy, not a limit of pi-typesafe: from 0.12 on its login store keeps a key
+ * for any backend and reads it once the variable is unset, and upstream pi-warden offers it for every registry name.
+ * True only for "typesafe"; an endpoint object always names its own variable, and a refused backend (undefined) names
+ * no store.
  */
 export function loginStoresKey(backend: JudgmentBackend | undefined): boolean {
   return backend === DEFAULT_BACKEND;
@@ -75,15 +77,12 @@ export function enableKeyRefusal(backend: JudgmentBackend, env: NodeJS.ProcessEn
   return `Cannot enable judgments: no ${label} key. Set ${keyEnv} in the environment; ${LOGIN_HINT} stores a TypeSafe key only.`;
 }
 
-/** How `/warden status` names a key that pi-typesafe holds for a backend whose key pi-warden never asks for or saves. */
-export const STORED_KEY_NAME = "a key stored in pi-typesafe/auth.json";
-
 /**
  * The key sentence of `/warden status`. Given pi-warden's login hint, pi-typesafe's describeAuth offers `/warden enable`
  * for every backend, which is right only for TypeSafe, the one key that command asks for. Every other backend's
- * sentence names its variable alone: a missing key waits for that variable, a store other users can read asks for the
- * chmod and nothing more, and a key pi-typesafe 0.12 and later read from its store for that backend is named by where
- * it is, because pi-warden never saved it.
+ * sentence names its variable alone: a missing key waits for that variable, and a store other users can read asks for
+ * the chmod and nothing more. A key pi-typesafe 0.12 and later would read from its store for that backend counts as
+ * missing, because pi-warden judges such a backend with its variable alone; the sentence says that key is not used.
  */
 export function describeKey(backend: JudgmentBackend): AuthReport {
   const state = authState({ backend, loginHint: LOGIN_HINT });
@@ -92,8 +91,9 @@ export function describeKey(backend: JudgmentBackend): AuthReport {
   const since = state.lastFailure ? ` Last failure: ${state.lastFailure.message}${state.lastFailure.at ? ` (${state.lastFailure.at})` : ""}` : "";
   const until = `every Jev judgment is skipped until ${keyEnv} is set in the environment`;
   if (state.kind === "missing") return { level: "error", text: `${label} key: missing — ${until}.${since}` };
+  if (state.kind === "stored") return { level: "error", text: `${label} key: missing — ${until}. The key stored for ${label} in pi-typesafe/auth.json is not used.${since}` };
   if (state.kind === "unusable") return { level: "error", text: `${label} key: unusable (${withoutLoginStep(state.reason)}) — ${until}.${since}` };
-  return describeAuth(state.kind === "stored" ? { ...state, keyName: STORED_KEY_NAME } : state, LOGIN_HINT);
+  return describeAuth(state, LOGIN_HINT);
 }
 
 /** pi-typesafe's refusal of a store other users can read, without the step after chmod that names `/warden enable`. */
@@ -116,7 +116,10 @@ export function disclosureFor(backend: JudgmentBackend | undefined, disclosure: 
 
 /**
  * Build the options forwarded to `createTypeSafe`.
- * The caller must gate on `authState({ backend }).usable` before calling `createTypeSafe`.
+ * The caller must gate on `authState({ backend }).usable` before calling `createTypeSafe`, and for a backend whose key
+ * stays in the environment (loginStoresKey false) also on that key coming from its variable: with no apiKey here,
+ * createTypeSafe reads the variable first and then falls back to a key stored for the backend, which pi-warden must not
+ * use. The extension's judgmentsOffReason is that gate; it runs in the same synchronous step as createTypeSafe.
  * No transport: pi-typesafe 0.13.1 replays the body itself on Bun, which is the fix our own fetch restated.
  */
 export function judgeOptions(config: { maxRequests: number; timeoutMs: number; typesafeBackend: JudgmentBackend }): TypeSafeOptions {

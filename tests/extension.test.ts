@@ -3162,12 +3162,13 @@ test("/warden status names only the variable for a backend whose key pi-warden n
       await chmod(join(store, "auth.json"), 0o644);
       assert.match(await keySentence(), /^OpenRouter key: unusable \(Refusing to read \S*pi-typesafe\/auth\.json: it is readable by other users\. Run chmod 600 on it\.\) — every Jev judgment is skipped until OPENROUTER_API_KEY is set in the environment\.$/, label);
 
-      // A key another pi-typesafe consumer stored for this backend: pi-typesafe reads it after the variable, and the
-      // status says where it is, not that /warden enable saved it.
+      // A key another pi-typesafe consumer stored for this backend: pi-typesafe would read it after the variable, but
+      // pi-warden judges this backend with its variable alone, so the key still counts as missing, and the status says
+      // that the stored one is not used.
       const id = typeof typesafeBackend === "string" ? typesafeBackend : typesafeBackend.keyEnv;
       await writeFile(join(store, "auth.json"), JSON.stringify({ version: 1, keys: { [id]: "sk-or-stored-test-key-0123456789" } }));
       await chmod(join(store, "auth.json"), 0o600);
-      assert.equal(await keySentence(), "OpenRouter key: a key stored in pi-typesafe/auth.json (not verified yet — the first request proves it).", label);
+      assert.equal(await keySentence(), "OpenRouter key: missing — every Jev judgment is skipped until OPENROUTER_API_KEY is set in the environment. The key stored for OpenRouter in pi-typesafe/auth.json is not used.", label);
       await rm(store, { recursive: true, force: true });
     }
   } finally {
@@ -5200,7 +5201,58 @@ test("judgments off: no key on OpenRouter names only its variable, since /warden
   }
 });
 
-const gateway = { label: "Acme judge gateway", host: "https://gw.acme.example", path: "/judge/v1/decide", keyEnv: "ACME_JUDGE_KEY", defaultModel: "jev-1.13" };
+test("judgments off: a backend whose key stays in the environment never judges with a key stored for it in pi-typesafe/auth.json", async () => {
+  const savedOpenRouter = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  const store = join(temporary, "agent", "pi-typesafe");
+  try {
+    const outcomes: Record<string, unknown> = {};
+    for (const typesafeBackend of ["openrouter", openRouterEndpoint]) {
+      // pi-typesafe 0.12 and later read such a key whenever the variable is unset: keys.openrouter for the registry name,
+      // keys.OPENROUTER_API_KEY for an endpoint object. pi-warden never writes one, but another pi-typesafe consumer can.
+      const id = typeof typesafeBackend === "string" ? typesafeBackend : typesafeBackend.keyEnv;
+      await mkdir(store, { recursive: true });
+      await writeFile(join(store, "auth.json"), JSON.stringify({ version: 1, keys: { [id]: "sk-or-stored-test-key-0123456789" } }), { mode: 0o600 });
+      await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend, rules: { enabled: false }, ...STACK_BAR }));
+      notices.length = 0;
+      const sentBefore = networkCalls;
+      const seenBefore = requestAuth.length;
+      await toolCall("bash", { command: "git push origin main" });
+      await toolCall("bash", { command: "npm test" });
+      await settleBackground();
+      await runCommand("status");
+      const stored = {
+        sent: networkCalls - sentBefore,
+        bearers: requestAuth.slice(seenBefore),
+        judgmentsOff: judgmentsOff(),
+        keySentence: /OpenRouter key: .*?(?= Build: pi-warden )/.exec(notices.at(-1)!.text)?.[0],
+      };
+      // The control: with the variable exported, the same session judges with the variable's key, the stored key beside it.
+      process.env.OPENROUTER_API_KEY = "sk-or-env-test-key-0000";
+      const exportedFrom = requestAuth.length;
+      await toolCall("bash", { command: "git push origin main" });
+      await settleBackground();
+      outcomes[JSON.stringify(typesafeBackend)] = { stored, exported: [...new Set(requestAuth.slice(exportedFrom))] };
+      delete process.env.OPENROUTER_API_KEY;
+      await rm(store, { recursive: true, force: true });
+    }
+    const expected = (name: string) => ({
+      stored: {
+        sent: 0,
+        bearers: [],
+        judgmentsOff: [`warden: Jev judgments are off (no key for ${name}). Set OPENROUTER_API_KEY.`],
+        keySentence: "OpenRouter key: missing — every Jev judgment is skipped until OPENROUTER_API_KEY is set in the environment. The key stored for OpenRouter in pi-typesafe/auth.json is not used.",
+      },
+      exported: ["Bearer sk-or-env-test-key-0000"],
+    });
+    assert.deepEqual(outcomes, { [JSON.stringify("openrouter")]: expected("openrouter"), [JSON.stringify(openRouterEndpoint)]: expected("OpenRouter") });
+  } finally {
+    if (savedOpenRouter === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = savedOpenRouter;
+    await rm(store, { recursive: true, force: true });
+  }
+});
+
+const gateway ={ label: "Acme judge gateway", host: "https://gw.acme.example", path: "/judge/v1/decide", keyEnv: "ACME_JUDGE_KEY", defaultModel: "jev-1.13" };
 
 test("the commandcode backend sends judgments to its own host, path, and model", async () => {
   await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: "commandcode", rules: { enabled: false }, ...STACK_BAR }));

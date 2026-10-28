@@ -222,10 +222,15 @@ test("the once-per-session notice says why judgments are off", () => {
 test("a backend whose key /warden enable never asks for is pointed at its variable alone", () => {
   const openrouter = { typesafeBackend: "openrouter" as const, backendRefusal: undefined };
   assert.equal(judgmentsOffText("no_key", openrouter, false), "warden: Jev judgments are off (no key for openrouter). Set OPENROUTER_API_KEY.");
-  // pi-typesafe 0.12 and later read a key stored for any backend; pi-warden never saves this one, so the notice says
-  // where the key is and that its variable replaces it.
-  assert.equal(judgmentsOffText("key_rejected", openrouter, false), "warden: Jev judgments are off (the key stored for openrouter in pi-typesafe/auth.json was rejected). Set OPENROUTER_API_KEY.");
-  assert.equal(judgmentsOffText("key_rejected", openrouter, false, "OPENROUTER_API_KEY"), "warden: Jev judgments are off (the key in OPENROUTER_API_KEY was rejected). Check the key, then run /warden status.");
+  // Such a backend judges with its variable alone, never with a key pi-typesafe holds for it in its store, so a rejected
+  // key is that variable's, even where the caller (the rules and bench reports) does not name it.
+  const rejected = "warden: Jev judgments are off (the key in OPENROUTER_API_KEY was rejected). Check the key, then run /warden status.";
+  assert.equal(judgmentsOffText("key_rejected", openrouter, false), rejected);
+  assert.equal(judgmentsOffText("key_rejected", openrouter, false, "OPENROUTER_API_KEY"), rejected);
+  const endpoint = { typesafeBackend: { label: "OpenRouter", host: "https://openrouter.ai", path: "/api/alpha/decisions", keyEnv: "OPENROUTER_API_KEY", defaultModel: "~typesafe/jev-latest" }, backendRefusal: undefined };
+  assert.equal(judgmentsOffText("key_rejected", endpoint, false), rejected);
+  // TypeSafe alone may judge with a stored key, the one /warden enable saved, and that is the key a bare rejection names.
+  assert.equal(judgmentsOffText("key_rejected", { typesafeBackend: "typesafe", backendRefusal: undefined }, false), "warden: Jev judgments are off (the key saved by /warden enable was rejected). Run /warden enable to replace it.");
 });
 
 test("every hint pi-warden writes names its own login, and pi-typesafe's text follows it", async () => {
