@@ -3561,6 +3561,9 @@ export default function wardenExtension(host: ExtensionAPI): void {
           const path = writeUserSetting("typesafe", true);
           client = undefined;
           budgetExhausted = false;
+          // A key proved just now replaces the one whose 401 or 403 may have paused the judge for judge.cooldownMs:
+          // trust the judge again at once. A key that was already in effect proves nothing new and leaves a pause alone.
+          if (key.login) cooldown.reset();
           report(`TypeSafe judgments enabled and saved to ${path}${key.login ? `; key ${key.login.models === undefined ? "verified with one request" : `verified (${key.login.models} model${key.login.models === 1 ? "" : "s"})`} and stored at ${key.login.path}` : ` using the ${key.source === "stored" ? "stored key" : `key from ${resolveBackend(config.typesafeBackend).keyEnv}`}`}. This stays on in new sessions until /warden disable.${explicitConsentNote(true)}`);
           return;
         }

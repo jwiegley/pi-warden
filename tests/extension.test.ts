@@ -5277,8 +5277,15 @@ test("/warden enable replaces a saved TypeSafe key that TypeSafe rejected, and l
     assert.equal(keyPrompts, 0);
     assert.match(notices.at(-1)!.text, / using the stored key\. /);
 
+    // TypeSafe rejects that key on a live request: pi-typesafe records the 403, and the judge pauses for
+    // judge.cooldownMs (60 s by default).
+    failStatus = 403;
+    await toolCall("bash", { command: "git push origin main" });
+    failStatus = undefined;
+    assert.equal(paused().length, 1, "the 403 paused the judge");
+    assert.match(paused()[0]!.text, /after a auth failure/);
+
     // Once rejected, /warden enable asks for a new key, and a cancel leaves the store as it was.
-    await rejectKey();
     keyInput = undefined;
     await runCommand("enable");
     assert.deepEqual({ keyPrompts, notice: notices.at(-1)?.text, store: await readStore() }, {
@@ -5295,13 +5302,15 @@ test("/warden enable replaces a saved TypeSafe key that TypeSafe rejected, and l
     assert.deepEqual(await readStore(), store(keyInput), "only the TypeSafe entry changes");
     assert.match(notices.at(-1)!.text, /key verified \(1 model\) and stored at/);
     assert.ok(notices.every(notice => !/ts_live_new_key|ts-saved-test-key/.test(notice.text)), "no key is echoed");
-    await runCommand("status");
-    assert.match(notices.at(-1)!.text, /TypeSafe key: the key saved by \/warden enable \(verified/);
-    // The rejection is cleared, so the same session judges again, with the new key.
+    // The proof clears the rejection and ends the pause the 403 opened, so the very next guarded call, well inside
+    // the 60 s window, is judged with the new key.
     nextAnswers = { irreversible: 0.2, off_task: 0.1, scope: "expected_step" };
     await toolCall("bash", { command: "git push origin main" });
-    assert.ok(requestAuth.length >= 1, "a judgment is sent");
+    assert.ok(requestAuth.length >= 1, "a judgment is sent right after the replacement");
     assert.ok(requestAuth.every(header => header === `Bearer ${keyInput}`), "every judgment carries the new key");
+    await runCommand("status");
+    assert.match(notices.at(-1)!.text, /TypeSafe key: the key saved by \/warden enable \(verified/);
+    assert.match(notices.at(-1)!.text, /, 0 checks without Jev during a judge cooldown;/, "no check was skipped by the old pause");
   } finally {
     process.env.TYPESAFE_API_KEY = "offline-test-key";
   }
