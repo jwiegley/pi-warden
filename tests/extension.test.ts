@@ -6541,6 +6541,43 @@ test("pi-warden's own write applies at once, and it is not a change to report", 
   assert.deepEqual(changes(), [], "pi-warden's own write never raises the line");
 });
 
+test("a session that began on an unreadable user file takes the fixed file at pi-warden's own write, as the next session would read it", async () => {
+  const savedConsent = process.env.PI_WARDEN_DEFAULT_CONSENT;
+  const savedBackend = process.env.PI_WARDEN_DEFAULT_BACKEND;
+  process.env.PI_WARDEN_DEFAULT_CONSENT = "1";
+  process.env.PI_WARDEN_DEFAULT_BACKEND = "openrouter";
+  const status = async (): Promise<string> => { await runCommand("status"); return notices.at(-1)!.text; };
+  const refused = /judgments are off: pi-warden\/config\.json cannot be read as a JSON object/;
+  try {
+    await clearProjectConfig();
+    await writeFile(configPath(), "{broken");
+    await sessionStart();
+    assert.match(await status(), refused);
+    // A hand fix is an outside edit: the session keeps the refusal it started with.
+    await writeFile(configPath(), JSON.stringify({ typesafe: false }));
+    assert.match(await status(), refused, "the hand fix waits for the next session");
+    // The write merges into the fixed file, so the session takes that file as it now reads, not the write alone.
+    await runCommand("mode advise");
+    assert.match(notices.at(-1)!.text, /Mode set to advise/);
+    assert.deepEqual(JSON.parse(await readFile(configPath(), "utf8")), { typesafe: false, mode: "advise" });
+    const fixed = await status();
+    assert.doesNotMatch(fixed, /consented via PI_WARDEN_DEFAULT_CONSENT/, "the file withdrew consent, and no default stands in for it");
+    assert.match(fixed, /TypeSafe judgments not consented \(run \/warden enable\)/);
+    assert.match(fixed, /mode advise/, "the written key applies at once");
+    assert.doesNotMatch(fixed, refused);
+    // A fixed file that records no consent choice takes the default consent, as the next session would.
+    await writeFile(configPath(), "{broken");
+    await sessionStart();
+    await writeFile(configPath(), "{}");
+    await runCommand("mode steer");
+    assert.match(await status(), /consented via PI_WARDEN_DEFAULT_CONSENT/);
+  } finally {
+    if (savedConsent === undefined) delete process.env.PI_WARDEN_DEFAULT_CONSENT; else process.env.PI_WARDEN_DEFAULT_CONSENT = savedConsent;
+    if (savedBackend === undefined) delete process.env.PI_WARDEN_DEFAULT_BACKEND; else process.env.PI_WARDEN_DEFAULT_BACKEND = savedBackend;
+    await rm(configPath(), { force: true });
+  }
+});
+
 test("with no UI, the change line is the status message", async () => {
   await writeConfig(JSON.stringify({ mode: "steer", rules: { enabled: false } }));
   const headless = context({ hasUI: false });
