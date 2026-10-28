@@ -13,7 +13,7 @@ const MouseRegion: MouseRegionConstructor | undefined = (tuiModule as Partial<{ 
 import { authState, backendHost, createTypeSafe, describeAuth, resolveBackend, chunkEvaluationRequest } from "pi-typesafe";
 import type { TypeSafe } from "pi-typesafe";
 import { ensureApiKey } from "pi-typesafe/ui";
-import { LOGIN_HINT, backendName, describeBackend, disclosureFor, judgeOptions, loginStoresKey } from "./backend.js";
+import { LOGIN_HINT, backendName, describeBackend, disclosureFor, enableKeyRefusal, judgeOptions, loginStoresKey } from "./backend.js";
 import type { BackendSetting, JudgmentsOffReason } from "./backend.js";
 import { ActionGuard } from "./action-guard.js";
 import { adaptHost } from "./host-compat.js";
@@ -276,7 +276,7 @@ export function judgmentsOffText(reason: Exclude<JudgmentsOffReason, "budget">, 
       : `warden: Jev judgments are off (typesafeBackend refused: ${setting.backendRefusal ?? "the configured value is not usable"})`;
     case "no_key": {
       const backend = setting.typesafeBackend;
-      // With the pinned pi-typesafe, /warden enable stores the TypeSafe key only; loginStoresKey says which backend that is.
+      // /warden enable asks for the TypeSafe key only; every other backend's key comes from its variable (loginStoresKey).
       const hint = loginStoresKey(backend) ? " or run /warden enable" : "";
       return `warden: Jev judgments are off (no key for ${backendName(backend)}). Set ${resolveBackend(backend).keyEnv}${hint}.`;
     }
@@ -885,8 +885,10 @@ export default function wardenExtension(host: ExtensionAPI): void {
     if (!event || !noticeUi) return;
     if (event.type === "recovered") { noticeUi.notify("warden: judgments resumed.", "info"); return; }
     const seconds = Math.round(event.ms / 1000);
+    // /warden enable takes the TypeSafe key only; any other backend's key is replaced in its variable.
+    const backend = judgeConfig?.typesafeBackend;
     const remedy = event.kind === "auth"
-      ? ` Set ${resolveBackend(judgeConfig?.typesafeBackend).keyEnv} or run /warden enable.`
+      ? ` Set ${resolveBackend(backend).keyEnv}${loginStoresKey(backend) ? " or run /warden enable" : ""}.`
       : event.kind === "configuration" ? " /warden status shows the backend setup." : "";
     noticeUi.notify(`warden: judgments paused for ${seconds}s after a ${event.kind} failure; pattern checks run alone until then.${remedy}`, "warning");
   };
@@ -3523,14 +3525,20 @@ export default function wardenExtension(host: ExtensionAPI): void {
           }
           const backend = config.typesafeBackend;
           if (!ctx.hasUI) { report(`Consent needs an interactive session. For headless runs set PI_WARDEN_ENABLED=1 and ${resolveBackend(backend).keyEnv} explicitly.`, "warning"); return; }
+          // Every backend but TypeSafe takes its key from its own variable alone, so without it exported there is nothing
+          // to consent to: refuse before the dialog, and before ensureApiKey could prompt for that key and store it.
+          const keyRefusal = backend === undefined ? undefined : enableKeyRefusal(backend);
+          if (keyRefusal !== undefined) { report(keyRefusal, "warning"); return; }
           // For a non-TypeSafe backend the dialog names who answers: the label, host, and model sent.
           const consentText = backend === undefined || backend === "typesafe"
             ? disclosure
             : `Judgments go to ${describeBackend(backend)}. ${disclosureFor(backend, disclosure)}`;
           if (!await ctx.ui.confirm("Enable TypeSafe judgments for pi-warden?", consentText)) return;
-          // One flow: consent, then a key if none is configured yet. TypeSafe prompts, verifies, and stores the key for every
-          // pi-typesafe consumer; any other backend has no login, so a missing key is reported with the variable to set.
+          // One flow: consent, then a key if none is configured yet. Only TypeSafe can arrive here without one: ensureApiKey
+          // prompts for it, verifies it, and stores it for every pi-typesafe consumer. Any other backend arrives with its
+          // variable exported, which ensureApiKey returns without a prompt.
           const key = await ensureApiKey(ctx, { ...(backend === undefined ? {} : { backend }), loginHint: LOGIN_HINT });
+          // Only the TypeSafe prompt can be cancelled, so the console named here is TypeSafe's.
           if (!key) { report("No key entered; pi-warden stays on pattern checks only. Run /warden enable again when you have a key from console.typesafe.ai.", "warning"); return; }
           const path = writeUserSetting("typesafe", true);
           client = undefined;

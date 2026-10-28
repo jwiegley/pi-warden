@@ -51,13 +51,28 @@ export function backendName(backend: JudgmentBackend | undefined): string {
 export const LOGIN_HINT = "/warden enable";
 
 /**
- * Whether `/warden enable` can store this backend's key. This fork bundles the pinned pi-typesafe fork (0.10.0 with
- * `loginHint`), whose login store keeps the TypeSafe key only: its `ensureApiKey` refuses any other backend and points
- * at the backend's variable instead. So this is true only for "typesafe" until the pin moves to a pi-typesafe 0.12 or
- * later fork, which keeps one key per registry backend and is what upstream's every-registry-name answer assumes.
+ * Whether `/warden enable` asks for and stores this backend's key. Only the TypeSafe key is ever asked for: every other
+ * backend's credential stays in the environment, in that backend's own variable, so pi-warden never prompts for it and
+ * never writes it to disk. That is policy, not a limit of pi-typesafe: from 0.12 on its login store keeps a key for any
+ * backend, and upstream pi-warden offers it for every registry name. True only for "typesafe"; an endpoint object
+ * always names its own variable, and a refused backend (undefined) names no store.
  */
 export function loginStoresKey(backend: JudgmentBackend | undefined): boolean {
   return backend === DEFAULT_BACKEND;
+}
+
+/**
+ * Why `/warden enable` cannot go on for this backend, or undefined when it can. A backend whose key lives only in the
+ * environment needs its variable exported first; otherwise the command would leave the key to pi-typesafe's
+ * `ensureApiKey`, which from 0.12 on prompts for any backend's key and stores it. The variable itself decides: a key
+ * that some other pi-typesafe consumer stored for the backend, which 0.12 and later read after the variable, does not
+ * count.
+ */
+export function enableKeyRefusal(backend: JudgmentBackend, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (loginStoresKey(backend)) return undefined;
+  const { label, keyEnv } = resolveBackend(backend);
+  if (env[keyEnv]?.trim()) return undefined;
+  return `Cannot enable judgments: no ${label} key. Set ${keyEnv} in the environment; ${LOGIN_HINT} stores a TypeSafe key only.`;
 }
 
 /** One phrase naming where judgments go — the label, the host, and the model sent — for consent text and status lines. */

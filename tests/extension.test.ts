@@ -3032,6 +3032,53 @@ test("/warden enable without a key asks for one after consent, verifies it, stor
   }
 });
 
+/** Hera's OpenRouter endpoint object: the registry backend's key variable, with the model chosen in the user file. */
+const openRouterEndpoint = { label: "OpenRouter", host: "https://openrouter.ai", path: "/api/alpha/decisions", keyEnv: "OPENROUTER_API_KEY", defaultModel: "~typesafe/jev-latest" };
+
+test("/warden enable without the variable of a backend other than TypeSafe refuses before consent, and never prompts for or stores that key", async () => {
+  const savedOpenRouter = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  const storedKeyPath = join(temporary, "agent", "pi-typesafe", "auth.json");
+  try {
+    for (const typesafeBackend of ["openrouter", openRouterEndpoint]) {
+      await writeConfig(JSON.stringify({ typesafeBackend, rules: { enabled: false }, ...STACK_BAR }));
+      const saved = await readFile(configPath(), "utf8");
+      notices.length = 0; confirms.length = 0; keyPrompts = 0;
+      // A plausible key waits at the prompt, so a prompt that did open would verify the key and store it.
+      keyInput = "sk-or-v1-0123456789abcdef0123456789abcdef";
+      await runCommand("enable");
+      const label = JSON.stringify(typesafeBackend);
+      assert.equal(confirms.length, 0, `${label}: nothing to consent to without the key`);
+      assert.equal(keyPrompts, 0, `${label}: no prompt for an OpenRouter key`);
+      assert.equal(notices.at(-1)!.level, "warning");
+      assert.equal(notices.at(-1)!.text, "Cannot enable judgments: no OpenRouter key. Set OPENROUTER_API_KEY in the environment; /warden enable stores a TypeSafe key only.");
+      assert.ok(notices.every(notice => !/enabled and saved|console\.typesafe\.ai/.test(notice.text)), `${label}: neither enabled nor sent to TypeSafe's console`);
+      await assert.rejects(readFile(storedKeyPath), `${label}: no key is stored`);
+      assert.equal(await readFile(configPath(), "utf8"), saved, `${label}: consent is not saved`);
+      assert.equal(networkCalls + modelListCalls, 0, `${label}: nothing is sent`);
+    }
+  } finally {
+    if (savedOpenRouter === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = savedOpenRouter;
+  }
+});
+
+test("/warden enable with the backend's variable exported asks for consent and uses that key, with no prompt and nothing stored", async () => {
+  const savedOpenRouter = process.env.OPENROUTER_API_KEY;
+  process.env.OPENROUTER_API_KEY = "sk-or-fake-test-key-0000";
+  try {
+    await writeConfig(JSON.stringify({ typesafeBackend: openRouterEndpoint, rules: { enabled: false }, ...STACK_BAR }));
+    await runCommand("enable");
+    assert.equal(confirms.length, 1, "the disclosure is still asked");
+    assert.match(confirms[0]!.message, /Judgments go to OpenRouter at openrouter\.ai, model ~typesafe\/jev-latest/);
+    assert.equal(keyPrompts, 0);
+    assert.match(notices.at(-1)!.text, /^TypeSafe judgments enabled and saved to .* using the key from OPENROUTER_API_KEY\. This stays on/);
+    assert.equal(JSON.parse(await readFile(configPath(), "utf8")).typesafe, true);
+    await assert.rejects(readFile(join(temporary, "agent", "pi-typesafe", "auth.json")), "the key stays in the environment");
+  } finally {
+    if (savedOpenRouter === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = savedOpenRouter;
+  }
+});
+
 test("/warden config opens the interactive panel and saves on 's'", async () => {
   await grantConsent();
   await runCommand("config");
@@ -4906,6 +4953,21 @@ test("judge cooldown: one auth failure pauses at once and the notice names the r
   const asked = networkCalls;
   await toolCall("bash", { command: "npm run lint" });
   assert.equal(networkCalls, asked);
+});
+
+test("judge cooldown: an auth failure on a backend whose key comes from the environment names only its variable", async () => {
+  const savedOpenRouter = process.env.OPENROUTER_API_KEY;
+  process.env.OPENROUTER_API_KEY = "sk-or-fake-test-key-0000";
+  try {
+    await writeConfig(JSON.stringify({ typesafe: true, notices: true, typesafeBackend: "openrouter", rules: { enabled: false }, timeoutMs: 50, ...STACK_BAR }));
+    failStatus = 401;
+    await toolCall("bash", { command: "npm test" });
+    assert.equal(paused().length, 1);
+    assert.match(paused()[0]!.text, /auth failure; pattern checks run alone until then\. Set OPENROUTER_API_KEY\.$/);
+    assert.doesNotMatch(paused()[0]!.text, /\/warden enable/, "/warden enable takes no OpenRouter key");
+  } finally {
+    if (savedOpenRouter === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = savedOpenRouter;
+  }
 });
 
 test("judge cooldown: after cooldownMs the judge is asked again, and recovery is announced exactly once", async t => {
