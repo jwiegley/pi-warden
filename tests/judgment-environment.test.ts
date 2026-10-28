@@ -206,6 +206,8 @@ test("the once-per-session notice says why judgments are off", () => {
     /cannot be read as a JSON object/,
     "an unreadable user file is reported as itself, not as a refused backend value",
   );
+  // The session read the file once at its start, so a hand fix takes a new session; the advice says so.
+  assert.match(UNREADABLE_REFUSAL, /fix or remove it by hand, then start a new session with \/new to resume judgments\.$/);
   const setting = { typesafeBackend: "typesafe" as const, backendRefusal: undefined };
   delete process.env.PI_WARDEN_ENABLED;
   assert.match(judgmentsOffText("no_consent", setting, false), /Run \/warden enable\./);

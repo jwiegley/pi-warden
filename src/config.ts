@@ -1326,7 +1326,7 @@ function backendFromEnvironment(config: WardenConfig, env: NodeJS.ProcessEnv, na
  * withdraw consent, name a local judge, or keep project files from the judge, so judgments stay off until it is fixed
  * or removed: neither a default nor PI_WARDEN_BACKEND stands in for it.
  */
-export const UNREADABLE_REFUSAL = `${PACKAGE_NAME}/config.json cannot be read as a JSON object, so none of its settings can be honored; fix or remove it by hand to resume judgments.`;
+export const UNREADABLE_REFUSAL = `${PACKAGE_NAME}/config.json cannot be read as a JSON object, so none of its settings can be honored; fix or remove it by hand, then start a new session with /new to resume judgments.`;
 /** Why a write leaves such a file alone: replacing it would drop every setting in it unread. */
 export const UNREADABLE_WRITE = `${PACKAGE_NAME}/config.json cannot be read as a JSON object, so it was not changed; fix or remove it by hand first.`;
 
