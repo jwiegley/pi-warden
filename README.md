@@ -217,7 +217,8 @@ The fork's own changes, replayed onto each release:
   `PI_WARDEN_BACKEND` replaces the backend for one process; a `PI_WARDEN_ENABLED`
   value other than 1, true, yes, or on withdraws consent. A user file that cannot
   be read while managed defaults are set turns judgments off, and no writer
-  replaces it.
+  replaces it. A hand fix applies at the next session; a pi-warden write to the
+  fixed file applies the whole file at once, as the next session would read it.
 - Session history is read through the host's bounded reads when it has them.
 - Every hint names `/warden enable`, which pi-warden registers, instead of
   `/typesafe login`, which it never loads.

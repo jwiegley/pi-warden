@@ -485,6 +485,15 @@ export default function wardenExtension(host: ExtensionAPI): void {
   const sessionUserRaw = (): unknown => sessionUser ? sessionUser.value : readUserConfig(dirs);
   /** A write pi-warden makes itself: its keys apply at once, and it is not an outside change to report. */
   const userConfigWritten = (changes: ReadonlyMap<string, unknown>): void => {
+    // A session that began on an unreadable file holds the refusal, not settings to merge into. The write succeeded, so
+    // the file reads again and holds the hand fix with the write merged over it: take the snapshot afresh from it.
+    // Built from the write alone, the snapshot would drop the fix (a withdrawn consent, a local judge) and let the
+    // managed defaults stand in for the file.
+    if (sessionUser !== undefined && sessionUser.value === undefined && sessionUser.mayExist !== false) {
+      sessionUser = { value: readUserConfigFile(dirs), mayExist: userConfigMayExist(dirs) };
+      seenUser = configKey(sessionUser.value);
+      return;
+    }
     let value: Record<string, unknown> = sessionUser?.value !== null && typeof sessionUser?.value === "object" ? { ...(sessionUser.value as Record<string, unknown>) } : {};
     for (const [key, setting] of changes) value = setNestedValue(value, key, setting);
     sessionUser = { value };
