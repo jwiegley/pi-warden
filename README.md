@@ -208,6 +208,8 @@ The fork's own changes, replayed onto each release:
   be read while managed defaults are set turns judgments off, and no writer
   replaces it. A hand fix applies at the next session; a pi-warden write to the
   fixed file applies the whole file at once, as the next session would read it.
+- A project file's `rules.files` may name only files inside the project;
+  absolute or climbing entries are dropped with a warning.
 - Session history is read through the host's bounded reads when it has them.
 - Every hint names `/warden enable`, which pi-warden registers, instead of
   `/typesafe login`, which it never loads.
