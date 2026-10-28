@@ -276,8 +276,8 @@ export function judgmentsOffText(reason: Exclude<JudgmentsOffReason, "budget">, 
       : `warden: Jev judgments are off (typesafeBackend refused: ${setting.backendRefusal ?? "the configured value is not usable"})`;
     case "no_key": {
       const backend = setting.typesafeBackend;
-      // pi-warden's own login stores the configured backend's key; it takes no backend name.
-      const hint = loginStoresKey(backend) && typeof backend === "string" ? " or run /warden enable" : "";
+      // With the pinned pi-typesafe, /warden enable stores the TypeSafe key only; loginStoresKey says which backend that is.
+      const hint = loginStoresKey(backend) ? " or run /warden enable" : "";
       return `warden: Jev judgments are off (no key for ${backendName(backend)}). Set ${resolveBackend(backend).keyEnv}${hint}.`;
     }
     case "key_rejected": return rejectedEnv
