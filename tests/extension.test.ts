@@ -5255,11 +5255,50 @@ test("judgments off: a rejected key saved by /warden enable is named as that key
     await sessionStart();
     await toolCall("bash", { command: "npm test" });
     await toolCall("bash", { command: "npm run lint" });
-    assert.deepEqual(judgmentsOff(), ["warden: Jev judgments are off (the key saved by /warden enable was rejected). Delete pi-typesafe/auth.json, then run /warden enable."]);
+    assert.deepEqual(judgmentsOff(), ["warden: Jev judgments are off (the key saved by /warden enable was rejected). Run /warden enable to replace it."]);
     assert.ok(!judgmentsOff()[0]!.includes("stored-test-key"));
     assert.equal(networkCalls, 0);
   } finally {
     process.env.TYPESAFE_API_KEY = savedTestKey;
+  }
+});
+
+test("/warden enable replaces a saved TypeSafe key that TypeSafe rejected, and leaves every other stored key alone", async () => {
+  delete process.env.TYPESAFE_API_KEY;
+  const storePath = join(temporary, "agent", "pi-typesafe", "auth.json");
+  // Another pi-typesafe consumer's key for another backend shares the file and must survive the replacement.
+  const store = (typesafe: string) => ({ version: 1, keys: { typesafe, openrouter: "sk-or-other-consumer-0123456789" } });
+  const readStore = async (): Promise<unknown> => JSON.parse(await readFile(storePath, "utf8"));
+  try {
+    await mkdir(join(temporary, "agent", "pi-typesafe"), { recursive: true });
+    await writeFile(storePath, JSON.stringify(store("ts-saved-test-key-0123456789")), { mode: 0o600 });
+    // A saved key that nothing rejected is used as it is.
+    await runCommand("enable");
+    assert.equal(keyPrompts, 0);
+    assert.match(notices.at(-1)!.text, / using the stored key\. /);
+
+    // Once rejected, /warden enable asks for a new key, and a cancel leaves the store as it was.
+    await rejectKey();
+    keyInput = undefined;
+    await runCommand("enable");
+    assert.deepEqual({ keyPrompts, notice: notices.at(-1)?.text, store: await readStore() }, {
+      keyPrompts: 1,
+      notice: "No key entered; pi-warden stays on pattern checks only. Run /warden enable again when you have a key from console.typesafe.ai.",
+      store: store("ts-saved-test-key-0123456789"),
+    });
+
+    // A new key is proved first, then replaces the TypeSafe entry alone, and the judge takes it.
+    keyInput = "ts_live_new_key_0123456789abcdef";
+    await runCommand("enable");
+    assert.equal(keyPrompts, 2);
+    assert.equal(modelListCalls, 1, "the new key is proved before it is saved");
+    assert.deepEqual(await readStore(), store(keyInput), "only the TypeSafe entry changes");
+    assert.match(notices.at(-1)!.text, /key verified \(1 model\) and stored at/);
+    assert.ok(notices.every(notice => !/ts_live_new_key|ts-saved-test-key/.test(notice.text)), "no key is echoed");
+    await runCommand("status");
+    assert.match(notices.at(-1)!.text, /TypeSafe key: the key saved by \/warden enable \(verified/);
+  } finally {
+    process.env.TYPESAFE_API_KEY = "offline-test-key";
   }
 });
 
