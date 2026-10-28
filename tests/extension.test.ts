@@ -5297,6 +5297,11 @@ test("/warden enable replaces a saved TypeSafe key that TypeSafe rejected, and l
     assert.ok(notices.every(notice => !/ts_live_new_key|ts-saved-test-key/.test(notice.text)), "no key is echoed");
     await runCommand("status");
     assert.match(notices.at(-1)!.text, /TypeSafe key: the key saved by \/warden enable \(verified/);
+    // The rejection is cleared, so the same session judges again, with the new key.
+    nextAnswers = { irreversible: 0.2, off_task: 0.1, scope: "expected_step" };
+    await toolCall("bash", { command: "git push origin main" });
+    assert.ok(requestAuth.length >= 1, "a judgment is sent");
+    assert.ok(requestAuth.every(header => header === `Bearer ${keyInput}`), "every judgment carries the new key");
   } finally {
     process.env.TYPESAFE_API_KEY = "offline-test-key";
   }
