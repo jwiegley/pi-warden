@@ -4,7 +4,7 @@ import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { authStatePath, createTypeSafe, openUsageLedger, resolveBackend, usagePath } from "pi-typesafe";
 import { judgeOptions } from "../backend.js";
-import { loadConfig, userConfigPath } from "../config.js";
+import { backendOrigin, loadConfig, userConfigPath } from "../config.js";
 import type { RulesConfig } from "../config.js";
 import { redact } from "../redact.js";
 import { describeTarget, EDIT_CONTEXT_LINES, EDIT_TEXT_LIMIT, evaluateRulesTarget, FALLBACK_FILES, MAX_EDITS, pathNotes, pathNoteSteer, projectPath, RuleStore, RULES_FILE, rulesCapNotice, rulesSteer, skipReason } from "../rules.js";
@@ -174,7 +174,10 @@ export async function claudeHook(event: string, raw: unknown, signal: AbortSigna
   };
   if (process.env.PI_WARDEN_ENABLED !== "1") return unavailable("no-consent", "rules judgments are off; set PI_WARDEN_ENABLED=1 for this headless host.");
   const backend = config.typesafeBackend;
-  if (backend === undefined) return unavailable("bad-backend", "rules judgments are off; fix typesafeBackend in the global user config.");
+  // PI_WARDEN_BACKEND, or PI_WARDEN_DEFAULT_BACKEND while the file names none, can be what was refused: name the
+  // variable then, with the loader's fixed text that never quotes its value, not a user file that is fine.
+  if (backend === undefined) return unavailable("bad-backend", backendOrigin(userRaw) !== undefined && config.backendRefusal !== undefined
+    ? `rules judgments are off; ${config.backendRefusal}` : "rules judgments are off; fix typesafeBackend in the global user config.");
   const key = process.env[resolveBackend(backend).keyEnv]?.trim();
   if (!key) return unavailable("no-key", "rules judgments are off; set the active backend key in the environment.");
   await readText(authStatePath(), signal);

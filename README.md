@@ -203,7 +203,7 @@ MIT licensed.
 
 ## Maintained fork
 
-This fork tracks upstream v2.2.5 and pins the `jwiegley/pi-typesafe` v0.13.1
+This fork tracks upstream v2.3.0 and pins the `jwiegley/pi-typesafe` v0.13.1
 source archive by commit. `npm ci && npm run check` builds that dependency
 before Warden. `npm pack` bundles the compiled TypeSafe fork and its runtime
 dependencies so the installed artifact also works. Nix substitutes the same fork's separately built artifact.
@@ -219,6 +219,14 @@ The fork's own changes, replayed onto each release:
   be read while managed defaults are set turns judgments off, and no writer
   replaces it. A hand fix applies at the next session; a pi-warden write to the
   fixed file applies the whole file at once, as the next session would read it.
+- Upstream's `pi-warden` command for Claude Code's rules hooks loads the user
+  file through this same reader, so `PI_WARDEN_BACKEND` and
+  `PI_WARDEN_DEFAULT_BACKEND` choose its backend as they do in Pi, and its notice
+  names the variable when that value is refused. Its consent stays upstream's:
+  an exported `PI_WARDEN_ENABLED=1` only, never `PI_WARDEN_DEFAULT_CONSENT` or a
+  saved `/warden enable`. It takes the key from the active backend's variable
+  alone, TypeSafe included, so it never reads a key stored in
+  `pi-typesafe/auth.json`.
 - A project file's `rules.files` may name only files inside the project;
   absolute or climbing entries are dropped with a warning.
 - Session history is read through the host's bounded reads when it has them.

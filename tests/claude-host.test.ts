@@ -466,6 +466,48 @@ test("global headless consent and active backend environment key are required in
   } finally { await rm(fx.root, { recursive: true, force: true }); }
 });
 
+test("a backend variable that names no registry backend turns rules judgments off and is named as the cause", async () => {
+  // The fork's PI_WARDEN_BACKEND replaces the file's backend and PI_WARDEN_DEFAULT_BACKEND fills a missing one; a value
+  // that is no registry name is refused. The notice names that variable, never the value, and not a user file that is fine.
+  for (const [name, overrides] of [["PI_WARDEN_BACKEND", {}], ["PI_WARDEN_DEFAULT_BACKEND", { typesafeBackend: undefined }]] as const) {
+    const fx = await fixture();
+    try {
+      const env = await judgeProject(fx, overrides);
+      const file = join(fx.project, "a.ts");
+      await writeFile(file, "BAD");
+      const result = await cli(fx, ["hook", "claude", "PostToolUse"], payload(fx, "Write", { file_path: file, content: "BAD" }), { ...env, [name]: "not-a-backend" });
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, new RegExp(`rules judgments are off; ${name} must name one of `));
+      assert.doesNotMatch(result.stdout, /global user config|not-a-backend/);
+      await assert.rejects(readFile(env.CLAUDE_TEST_CAPTURE!, "utf8"), { code: "ENOENT" });
+    } finally { await rm(fx.root, { recursive: true, force: true }); }
+  }
+  // A value refused in the user file itself keeps upstream's advice.
+  const fx = await fixture();
+  try {
+    const env = await judgeProject(fx, { typesafeBackend: "not-a-backend" });
+    const file = join(fx.project, "a.ts");
+    await writeFile(file, "BAD");
+    const result = await cli(fx, ["hook", "claude", "PostToolUse"], payload(fx, "Write", { file_path: file, content: "BAD" }), env);
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /rules judgments are off; fix typesafeBackend in the global user config\./);
+    await assert.rejects(readFile(env.CLAUDE_TEST_CAPTURE!, "utf8"), { code: "ENOENT" });
+  } finally { await rm(fx.root, { recursive: true, force: true }); }
+});
+
+test("the fork's managed default consent does not start rules judgments from a Claude hook", async () => {
+  const fx = await fixture();
+  try {
+    const env = await judgeProject(fx);
+    const file = join(fx.project, "a.ts");
+    await writeFile(file, "BAD");
+    const result = await cli(fx, ["hook", "claude", "PostToolUse"], payload(fx, "Write", { file_path: file, content: "BAD" }), { ...env, PI_WARDEN_ENABLED: "", PI_WARDEN_DEFAULT_CONSENT: "1" });
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /rules judgments are off; set PI_WARDEN_ENABLED=1 for this headless host\./);
+    await assert.rejects(readFile(env.CLAUDE_TEST_CAPTURE!, "utf8"), { code: "ENOENT" });
+  } finally { await rm(fx.root, { recursive: true, force: true }); }
+});
+
 test("project overrides do not grant trust or disable global rules", async () => {
   const fx = await fixture();
   try {
