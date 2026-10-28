@@ -140,6 +140,17 @@ test("one ask maps healthy, records five answers, and charges input tokens at th
   assert.equal(requests.length, 1);
 });
 
+test("a judge that reports no input tokens costs nothing, and a usage without the field is unusable", async () => {
+  // SDK 0.7.0 types a token count nullable. A count the backend did not report is priced as zero; a usage that lacks the
+  // field altogether is malformed, and never reads as a free answer.
+  const answer = (usage: unknown) => ({ evaluate: async () => ({ model: "jev-1.13.0", elapsedMs: 1, usage, answers: rawAnswers(probabilities) }) as never });
+  assert.deepEqual(await evaluateSupervision(metrics, options(answer({ input_tokens: null, output_tokens: null }))), {
+    ok: true,
+    result: { rootId: "root-1", kind: "healthy", probability: 0.7, confidence: 0.3999999999999999, answers: answerValues(probabilities), model: "jev-1.13.0", evaluatedAt: 1000, costUsd: 0 },
+  });
+  assert.deepEqual(await evaluateSupervision(metrics, options(answer({ output_tokens: 0 }))), { ok: false, reason: "unusable judge result" });
+});
+
 test("an answer from a model other than jev-1.13.0 is recorded", async () => {
   const outcome = await evaluateSupervision(metrics, options(stub(probabilities, "jev-9.9.9").judge));
   assert.equal(outcome.ok, true);
