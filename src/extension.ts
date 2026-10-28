@@ -10,10 +10,10 @@ import type { KeyId } from "@earendil-works/pi-tui";
 import * as tuiModule from "@earendil-works/pi-tui";
 type MouseRegionConstructor = new (child: ReturnType<typeof statusWidget>, onMouse: (event: { type: string; button: string }) => { handled: boolean } | undefined) => import("@earendil-works/pi-tui").Component;
 const MouseRegion: MouseRegionConstructor | undefined = (tuiModule as Partial<{ MouseRegion: MouseRegionConstructor }>).MouseRegion;
-import { authState, backendHost, createTypeSafe, describeAuth, resolveBackend, chunkEvaluationRequest } from "pi-typesafe";
+import { authState, backendHost, createTypeSafe, resolveBackend, chunkEvaluationRequest } from "pi-typesafe";
 import type { TypeSafe } from "pi-typesafe";
 import { ensureApiKey } from "pi-typesafe/ui";
-import { LOGIN_HINT, backendName, describeBackend, disclosureFor, enableKeyRefusal, judgeOptions, loginStoresKey } from "./backend.js";
+import { LOGIN_HINT, backendName, describeBackend, describeKey, disclosureFor, enableKeyRefusal, judgeOptions, loginStoresKey } from "./backend.js";
 import type { BackendSetting, JudgmentsOffReason } from "./backend.js";
 import { ActionGuard } from "./action-guard.js";
 import { adaptHost } from "./host-compat.js";
@@ -263,8 +263,9 @@ function planForCall(entries: ReturnType<ExtensionContext["sessionManager"]["get
 
 /**
  * The once-per-session notice: why Jev judgments are off and what turns them on. `rejectedEnv` is the environment
- * variable that holds a rejected key, or undefined when the rejected key is the one `/warden enable` saved. Never
- * names a key value or an absolute path.
+ * variable that holds a rejected key, or undefined when the rejected key is a stored one: for TypeSafe the key
+ * `/warden enable` saved, for any other backend a key some other pi-typesafe consumer stored. Never names a key value
+ * or an absolute path.
  */
 export function judgmentsOffText(reason: Exclude<JudgmentsOffReason, "budget">, setting: BackendSetting, headless: boolean, rejectedEnv?: string): string {
   switch (reason) {
@@ -280,9 +281,15 @@ export function judgmentsOffText(reason: Exclude<JudgmentsOffReason, "budget">, 
       const hint = loginStoresKey(backend) ? " or run /warden enable" : "";
       return `warden: Jev judgments are off (no key for ${backendName(backend)}). Set ${resolveBackend(backend).keyEnv}${hint}.`;
     }
-    case "key_rejected": return rejectedEnv
-      ? `warden: Jev judgments are off (the key in ${rejectedEnv} was rejected). Check the key, then run /warden status.`
-      : "warden: Jev judgments are off (the key saved by /warden enable was rejected). Delete pi-typesafe/auth.json, then run /warden enable.";
+    case "key_rejected": {
+      if (rejectedEnv) return `warden: Jev judgments are off (the key in ${rejectedEnv} was rejected). Check the key, then run /warden status.`;
+      const backend = setting.typesafeBackend;
+      // /warden enable saves only the TypeSafe key. Another backend's stored key came from elsewhere, and that backend's
+      // variable, which pi-typesafe reads first, is how it is replaced.
+      return loginStoresKey(backend)
+        ? "warden: Jev judgments are off (the key saved by /warden enable was rejected). Delete pi-typesafe/auth.json, then run /warden enable."
+        : `warden: Jev judgments are off (the key stored for ${backendName(backend)} in pi-typesafe/auth.json was rejected). Set ${resolveBackend(backend).keyEnv}.`;
+    }
   }
 }
 
@@ -3127,7 +3134,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
         if (action === "status") {
           // A refused backend has no key to describe; the refusal itself is the status line.
           const backend = config.typesafeBackend;
-          const auth = config.backendRefusal !== undefined || backend === undefined ? undefined : describeAuth(authState({ backend, loginHint: LOGIN_HINT }), LOGIN_HINT);
+          const auth = config.backendRefusal !== undefined || backend === undefined ? undefined : describeKey(backend);
           const source = consentSource(config);
           const backendFrom = backendSource(sessionUserRaw(), process.env, config);
           const usage = client?.getUsage();

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, test } from "node:test";
@@ -219,6 +219,15 @@ test("the once-per-session notice says why judgments are off", () => {
   }
 });
 
+test("a backend whose key /warden enable never asks for is pointed at its variable alone", () => {
+  const openrouter = { typesafeBackend: "openrouter" as const, backendRefusal: undefined };
+  assert.equal(judgmentsOffText("no_key", openrouter, false), "warden: Jev judgments are off (no key for openrouter). Set OPENROUTER_API_KEY.");
+  // pi-typesafe 0.12 and later read a key stored for any backend; pi-warden never saves this one, so the notice says
+  // where the key is and that its variable replaces it.
+  assert.equal(judgmentsOffText("key_rejected", openrouter, false), "warden: Jev judgments are off (the key stored for openrouter in pi-typesafe/auth.json was rejected). Set OPENROUTER_API_KEY.");
+  assert.equal(judgmentsOffText("key_rejected", openrouter, false, "OPENROUTER_API_KEY"), "warden: Jev judgments are off (the key in OPENROUTER_API_KEY was rejected). Check the key, then run /warden status.");
+});
+
 test("every hint pi-warden writes names its own login, and pi-typesafe's text follows it", async () => {
   const setting = { typesafeBackend: "typesafe" as const, backendRefusal: undefined };
   assert.match(judgmentsOffText("no_key", setting, false), /or run \/warden enable\./);
@@ -226,19 +235,28 @@ test("every hint pi-warden writes names its own login, and pi-typesafe's text fo
   assert.match(judgmentsOffText("key_rejected", setting, false), /key saved by \/warden enable/);
   assert.doesNotMatch(judgmentsOffText("key_rejected", setting, false), /\/typesafe/);
 
-  // pi-typesafe writes the status line and the login refusal; the hint is how they name pi-warden's command.
+  // pi-typesafe writes the status line and the refusals around the TypeSafe key; the hint is how they name pi-warden's
+  // command. (/warden enable on any other backend stops before ensureApiKey without the backend's variable; that refusal
+  // is pi-warden's own and is tested in tests/extension.test.ts.)
   const status = describeAuth(authState({ backend: "typesafe", loginHint: LOGIN_HINT }), LOGIN_HINT);
   assert.match(status.text, /\/warden enable or TYPESAFE_API_KEY/);
   assert.doesNotMatch(status.text, /\/typesafe/);
-  const savedOpenrouter = process.env.OPENROUTER_API_KEY;
-  delete process.env.OPENROUTER_API_KEY;
-  try {
-    await assert.rejects(
-      ensureApiKey({ hasUI: true } as never, { backend: "openrouter", loginHint: LOGIN_HINT }),
-      (error: unknown) => error instanceof Error && /\/warden enable stores a TypeSafe key only/.test(error.message),
-    );
-  } finally {
-    if (savedOpenrouter === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = savedOpenrouter;
+  if (process.platform !== "win32") {
+    // A store other local users can read is refused before any prompt, and the advice puts /warden enable after chmod.
+    const store = join(temporary, "pi-typesafe");
+    await mkdir(store, { recursive: true });
+    await writeFile(join(store, "auth.json"), JSON.stringify({ version: 1, keys: { typesafe: "ts-stored-test-key-0123456789" } }));
+    await chmod(join(store, "auth.json"), 0o644);
+    let prompted = false;
+    try {
+      await assert.rejects(
+        ensureApiKey({ hasUI: true, ui: { custom: async () => { prompted = true; return undefined; } } } as never, { loginHint: LOGIN_HINT }),
+        (error: unknown) => error instanceof Error && error.message.endsWith("it is readable by other users. Run chmod 600 on it, then run /warden enable again."),
+      );
+      assert.equal(prompted, false, "the refusal comes before any prompt");
+    } finally {
+      await rm(store, { recursive: true, force: true });
+    }
   }
 
   // The audit prompt asks for a tool pi-warden does not load, and no longer sends the agent after a command that is not there.
