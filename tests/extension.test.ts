@@ -3150,17 +3150,19 @@ test("/warden status names only the variable for a backend whose key pi-warden n
     await runCommand("status");
     return /OpenRouter key: .*?(?= Build: pi-warden )/.exec(notices.at(-1)!.text)?.[0] ?? "no key sentence";
   };
+  const until = "every Jev judgment is skipped until OPENROUTER_API_KEY is set in the environment.";
   try {
     for (const typesafeBackend of ["openrouter", openRouterEndpoint]) {
       const label = JSON.stringify(typesafeBackend);
       await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend, rules: { enabled: false }, ...STACK_BAR }));
-      assert.equal(await keySentence(), "OpenRouter key: missing — every Jev judgment is skipped until OPENROUTER_API_KEY is set in the environment.", label);
+      const sentences: Record<string, string> = {};
+      sentences.missing = await keySentence();
 
       // A store other users can read: the chmod is the whole fix, since /warden enable takes no OpenRouter key.
       await mkdir(store, { recursive: true });
       await writeFile(join(store, "auth.json"), JSON.stringify({ version: 1, keys: { typesafe: "ts-stored-test-key-0123456789" } }));
       await chmod(join(store, "auth.json"), 0o644);
-      assert.match(await keySentence(), /^OpenRouter key: unusable \(Refusing to read \S*pi-typesafe\/auth\.json: it is readable by other users\. Run chmod 600 on it\.\) — every Jev judgment is skipped until OPENROUTER_API_KEY is set in the environment\.$/, label);
+      sentences.unusable = (await keySentence()).replace(/Refusing to read \S*\/pi-typesafe\/auth\.json:/, "Refusing to read <agent dir>/pi-typesafe/auth.json:");
 
       // A key another pi-typesafe consumer stored for this backend: pi-typesafe would read it after the variable, but
       // pi-warden judges this backend with its variable alone, so the key still counts as missing, and the status says
@@ -3168,8 +3170,30 @@ test("/warden status names only the variable for a backend whose key pi-warden n
       const id = typeof typesafeBackend === "string" ? typesafeBackend : typesafeBackend.keyEnv;
       await writeFile(join(store, "auth.json"), JSON.stringify({ version: 1, keys: { [id]: "sk-or-stored-test-key-0123456789" } }));
       await chmod(join(store, "auth.json"), 0o600);
-      assert.equal(await keySentence(), "OpenRouter key: missing — every Jev judgment is skipped until OPENROUTER_API_KEY is set in the environment. The key stored for OpenRouter in pi-typesafe/auth.json is not used.", label);
+      sentences.stored = await keySentence();
+
+      // With the variable exported, its key is the one in effect, before and after a 401 or 403 on record. pi-typesafe
+      // writes these two sentences itself, so a hint it adds there later must not reach a backend /warden enable refuses.
+      process.env.OPENROUTER_API_KEY = "sk-or-env-test-key-0000";
+      sentences.exported = await keySentence();
+      await rejectKey();
+      sentences.rejected = await keySentence();
+      delete process.env.OPENROUTER_API_KEY;
       await rm(store, { recursive: true, force: true });
+
+      assert.deepEqual(sentences, {
+        missing: `OpenRouter key: missing — ${until}`,
+        unusable: `OpenRouter key: unusable (Refusing to read <agent dir>/pi-typesafe/auth.json: it is readable by other users. Run chmod 600 on it.) — ${until}`,
+        stored: `OpenRouter key: missing — ${until} The key stored for OpenRouter in pi-typesafe/auth.json is not used.`,
+        exported: "OpenRouter key: OPENROUTER_API_KEY (not verified yet — the first request proves it).",
+        rejected: "OpenRouter key: OPENROUTER_API_KEY was rejected. Last failure: rejected (2026-01-01T00:00:00.000Z)",
+      }, label);
+      // Whatever the state, the sentence names the variable, the one fix for this backend, and never offers /warden
+      // enable, which refuses this backend without the variable and stores no key for it.
+      for (const [state, sentence] of Object.entries(sentences)) {
+        assert.match(sentence, /OPENROUTER_API_KEY/, `${label}, ${state}: names the variable`);
+        assert.doesNotMatch(sentence, /\/warden enable/, `${label}, ${state}: offers no /warden enable`);
+      }
     }
   } finally {
     if (savedOpenRouter === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = savedOpenRouter;
