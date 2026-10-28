@@ -224,6 +224,11 @@ The fork's own changes, replayed onto each release:
 - Session history is read through the host's bounded reads when it has them.
 - Every hint names `/warden enable`, which pi-warden registers, instead of
   `/typesafe login`, which it never loads.
+- `/warden enable` asks for and stores the TypeSafe key only. Every other
+  backend, an endpoint object included, takes its key from its own environment
+  variable: without that variable exported, `/warden enable` refuses before the
+  consent dialog and never prompts for the key or writes it to disk, and a judge
+  paused by a rejected key names the variable, not `/warden enable`.
 - Offline checks that depended on host timing or Git display settings are
   deterministic.
 

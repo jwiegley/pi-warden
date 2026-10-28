@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { DECISIONS_BACKENDS, TypeSafeIntegrationError, createTypeSafe, noul, openUsageLedger } from "pi-typesafe";
-import { LOGIN_HINT, backendName, describeBackend, disclosureFor, judgeOptions, loginStoresKey, resolveJudgmentBackend } from "../src/backend.js";
+import { LOGIN_HINT, backendName, describeBackend, disclosureFor, enableKeyRefusal, judgeOptions, loginStoresKey, resolveJudgmentBackend } from "../src/backend.js";
 
 const gateway = { label: "Acme judge gateway", host: "https://gw.acme.example", path: "/judge/v1/decide", keyEnv: "ACME_JUDGE_KEY", defaultModel: "jev-1.13" };
 
@@ -31,7 +31,7 @@ test("resolveJudgmentBackend: an endpoint object is kept as written, and one pi-
   assert.match(bad.backendRefusal!, /absolute https/);
 });
 
-test("loginStoresKey is true only for typesafe, the one key the pinned pi-typesafe fork stores", () => {
+test("loginStoresKey is true only for typesafe, the one key /warden enable asks for", () => {
   assert.equal(loginStoresKey("typesafe"), true);
   assert.equal(loginStoresKey("openrouter"), false);
   assert.equal(loginStoresKey("commandcode"), false);
@@ -39,6 +39,18 @@ test("loginStoresKey is true only for typesafe, the one key the pinned pi-typesa
   assert.equal(loginStoresKey("subq"), false);
   assert.equal(loginStoresKey(undefined), false, "a refused backend names no store");
   assert.equal(loginStoresKey(gateway), false, "an endpoint object never gets the TypeSafe login store");
+});
+
+test("enableKeyRefusal: every backend but TypeSafe needs its own variable exported before /warden enable goes on", () => {
+  assert.equal(enableKeyRefusal("typesafe", {}), undefined, "TypeSafe may be asked for its key");
+  const refusal = "Cannot enable judgments: no OpenRouter key. Set OPENROUTER_API_KEY in the environment; /warden enable stores a TypeSafe key only.";
+  assert.equal(enableKeyRefusal("openrouter", {}), refusal);
+  assert.equal(enableKeyRefusal("openrouter", { OPENROUTER_API_KEY: "  " }), refusal, "a blank variable is no key");
+  assert.equal(enableKeyRefusal("openrouter", { TYPESAFE_API_KEY: "ts-fake-test-key" }), refusal, "another backend's variable does not count");
+  assert.equal(enableKeyRefusal("openrouter", { OPENROUTER_API_KEY: "sk-or-fake-test-key" }), undefined);
+  assert.match(enableKeyRefusal("commandcode", {})!, /^Cannot enable judgments: no Command Code key\. Set COMMANDCODE_API_KEY in the environment;/);
+  assert.match(enableKeyRefusal(gateway, {})!, /^Cannot enable judgments: no Acme judge gateway key\. Set ACME_JUDGE_KEY in the environment;/, "an endpoint object names its own variable");
+  assert.equal(enableKeyRefusal(gateway, { ACME_JUDGE_KEY: "acme-fake-test-key" }), undefined);
 });
 
 test("backendName shows the registry name or the endpoint label", () => {
