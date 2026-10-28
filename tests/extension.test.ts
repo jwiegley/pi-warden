@@ -3093,6 +3093,54 @@ test("/warden enable does not count a key that another pi-typesafe consumer stor
   }
 });
 
+test("/warden enable checks the variable again after the consent dialog, so a key withdrawn meanwhile is never asked for or stored", async () => {
+  const savedOpenRouter = process.env.OPENROUTER_API_KEY;
+  const storedKeyPath = join(temporary, "agent", "pi-typesafe", "auth.json");
+  // The variable is exported when the command starts and gone when the user answers the dialog, as when a session start
+  // during the dialog withdraws a key that nix-config's entry had copied into the process.
+  const withdrawing = context({ ui: { ...ui, confirm: async (title: string, message: string) => {
+    confirms.push({ title, message });
+    delete process.env.OPENROUTER_API_KEY;
+    return true;
+  } } });
+  try {
+    const outcomes: Record<string, unknown> = {};
+    for (const typesafeBackend of ["openrouter", openRouterEndpoint]) {
+      await rm(join(temporary, "agent", "pi-typesafe"), { recursive: true, force: true });
+      await writeConfig(JSON.stringify({ typesafeBackend, rules: { enabled: false }, ...STACK_BAR }));
+      const saved = await readFile(configPath(), "utf8");
+      notices.length = 0; confirms.length = 0; keyPrompts = 0;
+      const sentBefore = networkCalls + modelListCalls;
+      process.env.OPENROUTER_API_KEY = "sk-or-fake-test-key-0000";
+      // A plausible key waits at the prompt, so a prompt that did open would verify the key and store it.
+      keyInput = "sk-or-v1-0123456789abcdef0123456789abcdef";
+      await runCommand("enable", withdrawing);
+      // Everything at once, for both backends, so a failure shows the whole outcome: what was asked, said, stored, saved, and sent.
+      outcomes[JSON.stringify(typesafeBackend)] = {
+        consentDialogs: confirms.length,
+        keyPrompts,
+        notice: notices.at(-1)?.text,
+        level: notices.at(-1)?.level,
+        keyStored: existsSync(storedKeyPath),
+        consentSaved: (await readFile(configPath(), "utf8")) !== saved,
+        sent: networkCalls + modelListCalls - sentBefore,
+      };
+    }
+    const refused = {
+      consentDialogs: 1,
+      keyPrompts: 0,
+      notice: "Cannot enable judgments: no OpenRouter key. Set OPENROUTER_API_KEY in the environment; /warden enable stores a TypeSafe key only.",
+      level: "warning",
+      keyStored: false,
+      consentSaved: false,
+      sent: 0,
+    };
+    assert.deepEqual(outcomes, { [JSON.stringify("openrouter")]: refused, [JSON.stringify(openRouterEndpoint)]: refused });
+  } finally {
+    if (savedOpenRouter === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = savedOpenRouter;
+  }
+});
+
 test("/warden status names only the variable for a backend whose key pi-warden never asks for", async () => {
   const savedOpenRouter = process.env.OPENROUTER_API_KEY;
   delete process.env.OPENROUTER_API_KEY;

@@ -3542,6 +3542,10 @@ export default function wardenExtension(host: ExtensionAPI): void {
             ? disclosure
             : `Judgments go to ${describeBackend(backend)}. ${disclosureFor(backend, disclosure)}`;
           if (!await ctx.ui.confirm("Enable TypeSafe judgments for pi-warden?", consentText)) return;
+          // The dialog awaited the user, and the variable can be gone by now (a session start meanwhile may withdraw a
+          // copy nix-config's entry made). Check it again, or ensureApiKey would prompt for that key and store it.
+          const lateKeyRefusal = backend === undefined ? undefined : enableKeyRefusal(backend);
+          if (lateKeyRefusal !== undefined) { report(lateKeyRefusal, "warning"); return; }
           // One flow: consent, then a key if none is configured yet. Only TypeSafe can arrive here without one: ensureApiKey
           // prompts for it, verifies it, and stores it for every pi-typesafe consumer. Any other backend arrives with its
           // variable exported, which ensureApiKey returns without a prompt.
