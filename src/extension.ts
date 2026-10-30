@@ -146,6 +146,17 @@ function latestUserPrompt(ctx: ExtensionContext): string | undefined {
   return undefined;
 }
 
+/**
+ * The operator's prompt for this run, or undefined for a run a custom message starts (a goal continuation, a subagent
+ * notice), which no operator typed. Pi 1.3 fires before_agent_start for such a run with `messageType: "custom"` and no
+ * prompt; Pi 1.4 adds `prompt: ""`. A host that sends no messageType is read by the prompt alone, as before, so an empty
+ * operator prompt there still counts as one.
+ */
+function operatorPrompt(event: unknown): string | undefined {
+  const { messageType, prompt } = event as { messageType?: unknown; prompt?: unknown };
+  return messageType === "custom" || typeof prompt !== "string" ? undefined : prompt;
+}
+
 /** Scope context only: approval still comes from latestUserPrompt, never from this history. */
 function recentTaskContext(ctx: ExtensionContext): TaskMessage[] {
   const entries = recentEntries(ctx, { type: "message" });
@@ -1604,7 +1615,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
       clearFileIdentityCache();
       // The same custom-message case as the rules reminder: no operator prompt, nothing to assess. The state above
       // still resets, so nothing from an older prompt leaks into a later one.
-      const prompt = (event as { prompt?: unknown }).prompt;
+      const prompt = operatorPrompt(event);
       if (typeof prompt !== "string") {
         record(ctx, config, "conscience", "warden · conscience · turn start · skipped", [
           "trigger: before_agent_start",
@@ -1795,7 +1806,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
     // ── Rules at turn start ──
     // One request before the first model call of this user turn asks which of the project's rules apply, and the rules
     // that pass join the system prompt of this run. The quiet window silences it too, since it is a rules request.
-    const rulesText = config.enabled && config.rules.enabled && config.rulesAtTurnStart.enabled && !quiet.active(sessionIdFor(ctx)) ? await curateTurnStart(ctx, config, event.prompt) : undefined;
+    const rulesText = config.enabled && config.rules.enabled && config.rulesAtTurnStart.enabled && !quiet.active(sessionIdFor(ctx)) ? await curateTurnStart(ctx, config, operatorPrompt(event)) : undefined;
     appendToSystemPrompt(promptOptions, rulesText);
     for (const key of STANDING_KEYS) appendToSystemPrompt(promptOptions, standingText[key]);
     // A tip or a compaction appendix is for one run: left standing, it would ride every later prompt of the session.

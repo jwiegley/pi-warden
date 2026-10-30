@@ -6066,6 +6066,54 @@ test("rules at turn start: a run a custom message starts has no prompt, and the 
   }
 });
 
+/** The rules reminder and a conscience that would ask about any operator prompt, even an empty one. */
+const turnStartJudgeConfig = () => writeConfig(JSON.stringify({ typesafe: true, notices: true, rules: { enabled: true }, slop: { enabled: false }, done: { enabled: false }, cause: { enabled: false }, conscience: { enabled: true, localFloor: 0 }, ...STACK_BAR }));
+/** Which turn-start question each judgment request asked: a rule question or a conscience assessment. */
+const turnStartAsks = () => requests.map(request => "applies_0" in request.questions ? "rules" : "conscience_disposition" in request.questions ? "conscience" : Object.keys(request.questions).join(",")).sort();
+
+test("rules at turn start: Pi 1.4's custom-message run has an empty prompt, and neither the reminder nor the conscience asks Jev", async () => {
+  await turnStartJudgeConfig();
+  const rules = join(temporary, "pi-warden.md");
+  await writeFile(rules, "# No hardcoded secrets\nSource code must not contain passwords or API keys.\n");
+  try {
+    // Pi 1.4.0 fires before_agent_start for a run a custom message starts (a goal continuation, a subagent notice) with
+    // messageType "custom" and prompt "", where Pi 1.3.0 left the prompt out.
+    await fire("before_agent_start", {
+      messageType: "custom",
+      prompt: "",
+      message: { role: "custom", customType: "goal-continuation", content: "Keep working toward the goal.", display: true, timestamp: Date.now() },
+      systemPromptOptions: { cwd: temporary, skills: [conscienceSkill("tdd", "Test-driven development")] },
+    });
+    await fire("agent_start", {});
+    await settleBackground();
+    assert.deepEqual(turnStartAsks(), [], "no rule question and no conscience assessment is sent");
+    const skipped = (await recordedSince()).filter(entry => entry.details.includes("skipReason: custom_trigger"));
+    assert.deepEqual(skipped.map(entry => entry.line).sort(), ["warden · conscience · turn start · skipped", "warden · rules · turn start · skipped"]);
+  } finally {
+    await rm(rules, { force: true });
+  }
+});
+
+test("rules at turn start: an empty operator prompt is judged as before, with no messageType or messageType user", async () => {
+  await turnStartJudgeConfig();
+  const rules = join(temporary, "pi-warden.md");
+  await writeFile(rules, "# No hardcoded secrets\nSource code must not contain passwords or API keys.\n");
+  try {
+    // A host without messageType fires the event for user prompts only, and Pi 1.4 marks those "user": an empty prompt
+    // there is the operator's own, so only messageType "custom" may skip it.
+    for (const shape of [{}, { messageType: "user" }]) {
+      requests.length = 0;
+      await fire("before_agent_start", { ...shape, prompt: "", systemPromptOptions: { cwd: temporary, skills: [conscienceSkill("tdd", "Test-driven development")] } });
+      await waitFor(() => requests.length >= 2, `${JSON.stringify(shape)}: a rule question and a conscience assessment`);
+      assert.deepEqual(turnStartAsks(), ["conscience", "rules"], `${JSON.stringify(shape)}: both ask Jev`);
+    }
+    const skipped = (await recordedSince()).filter(entry => entry.details.includes("skipReason: custom_trigger"));
+    assert.deepEqual(skipped, [], "neither run is taken for a custom-message run");
+  } finally {
+    await rm(rules, { force: true });
+  }
+});
+
 test("rules at turn start: the request is redacted and the table carries the rule with its path scope", async () => {
   await curatorConfig();
   const key = projectKey();

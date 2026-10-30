@@ -230,6 +230,10 @@ The fork's own changes, replayed onto each release:
 - A project file's `rules.files` may name only files inside the project;
   absolute or climbing entries are dropped with a warning.
 - Session history is read through the host's bounded reads when it has them.
+- A run that a custom message starts (a goal continuation, a subagent notice)
+  sends no turn-start rules question or conscience assessment on Pi 1.4 either,
+  whose `before_agent_start` gives that run `messageType: "custom"` and an empty
+  prompt instead of no prompt. An empty operator prompt is still judged.
 - Hints about the TypeSafe key name `/warden enable`, which pi-warden
   registers, instead of `/typesafe login`, which it never loads. Where upstream
   sends the user to `/typesafe login` to replace a saved key that TypeSafe
